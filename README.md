@@ -6,6 +6,18 @@ il seed è sempre 42
 
 Sequenza manuale:
 
+Oppure eseguire tutto come grafo di dipendenze sui file:
+
+```bash
+./run_pipeline.sh
+```
+
+Il runner salta gli step con output più recenti degli input. Per forzare tutto:
+
+```bash
+./run_pipeline.sh --force
+```
+
 1. classificazione K-means sul CSV annuo:
 
     ```bash
