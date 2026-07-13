@@ -81,3 +81,120 @@ flowchart TD
 | 1 | `data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv` | `data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv`, `models/kmeans_model_annuo_peso_coord.joblib` |
 | 2 | `data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv`, `data_csv_parquet/calendario_raccolta.csv` | `data_csv_parquet/conferimenti_giornalieri_classificati.csv`, `data_csv_parquet/produzione_giornaliera_classificata.csv` |
 | 3 | `data_csv_parquet/conferimenti_giornalieri_classificati.csv` | `models/grouped_sgd_time_series.joblib`, `grouped_sgd_time_series_metrics.csv`, `predictions/sgd_test_predictions_grouped.parquet` |
+
+## ONNX inference service
+
+Install the exporter dependencies and convert the grouped scikit-learn bundle:
+
+```bash
+bin/python -m pip install -r onnx_inference/requirements-export.txt
+bin/python onnx_inference/export_models.py \
+  --input models/grouped_sgd_time_series.joblib \
+  --output-dir .tmp/grouped-sgd-onnx
+```
+
+The output contains `manifest.json` and one ONNX model for every
+`frazione`/`cluster_label` group. The exporter refuses to overwrite an existing
+directory; use a new directory for each model version.
+
+Build and run the CPU inference container with the package mounted read-only:
+
+```bash
+docker build -f onnx_inference/Dockerfile -t waste-onnx-inference .
+docker run --rm -p 8000:8000 \
+  -v "$PWD/.tmp/grouped-sgd-onnx:/models:ro" \
+  waste-onnx-inference
+```
+
+Check readiness and request predictions:
+
+```bash
+curl http://localhost:8000/readyz
+curl -X POST http://localhost:8000/v1/predict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "instances": [{
+      "data": "2024-09-10",
+      "anno_produzione": 2024,
+      "coord_x": 16.2896597,
+      "coord_y": 41.2407249,
+      "densita_locale": 384.0,
+      "giorni_accumulati": 3,
+      "zona_raccolta": 1,
+      "frazione": "altro_rd",
+      "cluster_label": 5
+    }]
+  }'
+```
+
+To deploy a new model, export it to a new directory and restart the container
+with that directory mounted at `/models`. The REST contract does not change.
+
+Run the exporter and API checks with:
+
+```bash
+bin/python -m pytest onnx_inference/test_inference.py
+```
+
+## ONNX clustering service
+
+Convert the annual K-means bundle into a versioned ONNX package:
+
+```bash
+bin/python -m pip install -r onnx_clustering/requirements-export.txt
+bin/python onnx_clustering/export_model.py \
+  --input models/kmeans_model_annuo_peso_coord.joblib \
+  --output-dir .tmp/kmeans-onnx
+```
+
+Build and run the standalone clustering service on host port 8001:
+
+```bash
+docker build -f onnx_clustering/Dockerfile -t waste-onnx-clustering .
+docker run --rm -p 8001:8000 \
+  -v "$PWD/.tmp/kmeans-onnx:/models:ro" \
+  waste-onnx-clustering
+```
+
+The service uses the same health, readiness, and batched prediction envelope as
+the regressor. The annual fields are required; `zona_costruzione` may be null.
+
+```bash
+curl http://localhost:8001/readyz
+curl -X POST http://localhost:8001/v1/predict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "instances": [{
+      "anno_produzione": 2024,
+      "coord_x": 16.3149866,
+      "coord_y": 41.2333986,
+      "densita_locale": 397,
+      "altro_rd_t": 4.47,
+      "carta_cartone_t": 76.623,
+      "frazione_organica_t": 266.098,
+      "ingombranti_misti_t": 139.054,
+      "legno_t": 0,
+      "metallo_t": 2.527,
+      "plastica_t": 22.206,
+      "pulizia_stradale_recupero_t": 0,
+      "raee_t": 0,
+      "rifiuti_cd_t": 0,
+      "selettiva_t": 0,
+      "tessili_t": 0,
+      "vetro_t": 28.849,
+      "zona_raccolta": 2,
+      "zona_costruzione": "B3R"
+    }]
+  }'
+```
+
+The response contains `cluster_label` and the nearest-centroid
+`cluster_distance`. Pass the label to the grouped regressor. Because K-means
+labels can change after retraining, deploy clustering and regressor packages
+trained from the same assignments together.
+
+Run the clustering checks with:
+
+```bash
+bin/python -m pytest onnx_clustering/test_clustering.py
+```
