@@ -176,6 +176,53 @@ Gli input sorgente non vengono copiati o modificati. Gli snapshot QuantumLeap
 restano temporanei. Il flag isola soltanto i file locali: se viene aggiunto
 anche `--publish-orion`, i digital twin vengono comunque pubblicati in Orion.
 
+### Esecuzione in container
+
+Creare l'immagine della pipeline:
+
+```bash
+docker build -f model-training/Dockerfile -t waste-model-training .
+```
+
+I dati sorgente e gli artefatti non sono inclusi nell'immagine. Per addestrare
+da file locali, montare i dati in sola lettura e una directory separata per gli
+output:
+
+```bash
+mkdir -p artifacts/container-file
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/data_csv_parquet:/app/data_csv_parquet:ro" \
+  -v "$PWD/artifacts/container-file:/artifacts" \
+  waste-model-training \
+  --source file --output-dir /artifacts --force
+```
+
+Per addestrare da QuantumLeap, collegare il job alla rete FIWARE e fornire gli
+stessi parametri del runner locale:
+
+```bash
+mkdir -p artifacts/container-quantumleap
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --network fiware-quantumleap_fiware \
+  -e QL_URL=http://fiware-quantumleap:8668 \
+  -e FIWARE_SERVICE=openiot \
+  -e FIWARE_SERVICE_PATH=/ \
+  -v "$PWD/artifacts/container-quantumleap:/artifacts" \
+  waste-model-training \
+  --source quantumleap \
+  --from-date 2024-01-01 \
+  --to-date 2024-12-31 \
+  --output-dir /artifacts
+```
+
+Tutte le opzioni mostrate da `./run_pipeline.sh --help`, incluse quelle per la
+pubblicazione Orion, possono essere aggiunte dopo il nome dell'immagine. Su
+Linux, `--user` fa sì che gli artefatti nei bind mount appartengano all'utente
+che avvia il container; senza override l'immagine usa l'utente non privilegiato
+`app` (UID 10001).
+
 ### Addestramento da QuantumLeap
 
 ```bash
