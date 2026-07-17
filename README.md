@@ -1,200 +1,467 @@
-# Riepilogo
+# Classificazione e previsione dei conferimenti rifiuti
 
-## ORDINE ESECUZIONE SCRIPT
+Questo progetto addestra e distribuisce due modelli:
 
-il seed è sempre 42
+- un classificatore K-means, che assegna ogni civico a un cluster usando i dati
+  annuali;
+- un regressore SGD raggruppato per frazione e cluster, che stima le tonnellate
+  dei conferimenti futuri.
 
-Sequenza manuale:
+I dati possono provenire da file locali oppure da QuantumLeap. I risultati
+possono essere pubblicati in Orion come entità `RifiutiDigitalTwin` e quindi
+salvati nuovamente in QuantumLeap tramite subscription Orion.
 
-Oppure eseguire tutto come grafo di dipendenze sui file:
+## Flusso completo
+
+```mermaid
+flowchart TD
+    U[Utente o applicazione] -->|pubblica RifiutiConferimento| O[Orion]
+    O -->|subscription| Q[QuantumLeap]
+    Q --> A[Aggregazione annuale per civico]
+    A --> C[Classificazione K-means]
+    C --> J[Etichette unite ai dati giornalieri]
+    J --> R[Addestramento regressore raggruppato]
+    R --> F[Previsioni su intervallo futuro]
+    C --> T[RifiutiDigitalTwin]
+    F --> T
+    T -->|pubblicazione| O
+```
+
+Esistono due modalità operative:
+
+1. **Pipeline di addestramento**: legge lo storico, ricostruisce entrambi i
+   modelli e, facoltativamente, pubblica classificazioni e previsioni.
+2. **Servizi ONNX**: usano modelli già esportati. Il servizio di clustering
+   classifica e pubblica le etichette; il servizio di regressione legge le
+   etichette da QuantumLeap, calcola il futuro e aggiorna gli stessi twin.
+
+I servizi ONNX eseguono solo inferenza: non addestrano e non aggiornano i file
+dei modelli.
+
+## Prerequisiti FIWARE
+
+Orion e QuantumLeap devono essere raggiungibili. Tutte le richieste devono usare
+gli stessi header tenant:
+
+```text
+Fiware-Service: openiot
+Fiware-ServicePath: /
+```
+
+Servono due subscription permanenti:
+
+- `RifiutiConferimento`, per salvare in QuantumLeap i dati pubblicati dagli
+  utenti;
+- `RifiutiDigitalTwin`, per salvare classificazioni e previsioni.
+
+Esempio per la prima subscription:
+
+```bash
+curl -i -X POST http://localhost:1026/v2/subscriptions \
+  -H 'Content-Type: application/json' \
+  -H 'Fiware-Service: openiot' \
+  -H 'Fiware-ServicePath: /' \
+  -d '{
+    "description": "Storico conferimenti in QuantumLeap",
+    "subject": {
+      "entities": [{
+        "idPattern": ".*",
+        "type": "RifiutiConferimento"
+      }]
+    },
+    "notification": {
+      "http": {
+        "url": "http://fiware-quantumleap:8668/v2/notify"
+      }
+    }
+  }'
+```
+
+Creare la seconda subscription con lo stesso comando, sostituendo tipo e
+descrizione con `RifiutiDigitalTwin`. L'URL di notifica deve essere raggiungibile
+dal container Orion: `localhost` indicherebbe Orion stesso, non QuantumLeap.
+
+Il progetto non crea automaticamente subscription permanenti.
+
+Per creare soltanto le subscription mancanti:
+
+```bash
+python manage_fiware_subscriptions.py
+```
+
+Per rimuovere le subscription dei due tipi dirette allo stesso URL QuantumLeap:
+
+```bash
+python manage_fiware_subscriptions.py --remove
+```
+
+URL e tenant possono essere modificati con `--orion-url`, `--notify-url`,
+`--service` e `--service-path` oppure tramite le variabili d'ambiente
+`ORION_URL`, `QL_NOTIFY_URL`, `FIWARE_SERVICE` e `FIWARE_SERVICE_PATH`.
+
+## Schema dei dati sorgente
+
+Ogni entità `RifiutiConferimento` rappresenta una frazione associata a un
+civico. L'entity ID è opaco; un formato possibile è `2231596:vetro`.
+
+Attributi richiesti:
+
+| Attributo | Tipo atteso | Significato |
+| --- | --- | --- |
+| `id_civico` | Integer o Text | Identificatore del civico; internamente viene normalizzato come testo |
+| `frazione` | Text | Nome della frazione |
+| `anno_produzione` | Integer | Anno di riferimento |
+| `coord_x`, `coord_y` | Number | Coordinate del civico |
+| `densita_locale` | Number | Densità locale |
+| `zona_raccolta` | Integer o Text | Zona da 1 a 4 |
+| `zona_costruzione` | Text | Categoria urbanistica |
+| `giorni_accumulati` | Number | Giorni confluiti nel conferimento |
+| `conferimento_t` | Number | Quantità in tonnellate |
+
+Frazioni riconosciute:
+
+```text
+altro_rd, carta_cartone, frazione_organica, ingombranti_misti,
+legno, metallo, plastica, pulizia_stradale_recupero, raee,
+rifiuti_cd, selettiva, tessili, vetro
+```
+
+Gli attributi richiesti devono essere presenti e allineati nello storico
+QuantumLeap. La pipeline rifiuta frazioni sconosciute, valori nulli, array
+temporali non allineati e conflitti nei campi statici dello stesso civico/anno.
+
+## Pipeline di addestramento
+
+Il comando principale è:
 
 ```bash
 ./run_pipeline.sh
 ```
 
-Il runner salta gli step con output più recenti degli input. Per forzare tutto:
+La sorgente predefinita è il file locale. Il flusso eseguito è:
+
+```text
+CSV annuale → K-means → distribuzione giornaliera sintetica
+             → regressore SGD raggruppato
+```
+
+Il runner salta gli step i cui output sono già più recenti degli input. Per
+rieseguirli:
 
 ```bash
 ./run_pipeline.sh --force
 ```
 
-1. classificazione K-means sul CSV annuo:
-
-    ```bash
-    python model-training/classification/train_kmeans.py --input data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv --n-clusters 6 --output data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv --output-format csv --model-output models/kmeans_model_annuo_peso_coord.joblib --coord-weight 8 --annual-kg-weight 0.5 --other-numeric-weight 1 --categorical-weight 1
-    ```
-
-2. calcolo della produzione e conferimento giornaliero dal CSV annuo classificato:
-
-    ```bash
-    python dataset/distribuzione_giornaliera.py --annuo data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv --anno 2024 --calendario data_csv_parquet/calendario_raccolta.csv --id-col "id_civico" --zona-col "zona_raccolta" --seed 42 --out data_csv_parquet/conferimenti_giornalieri_classificati.csv --out-produzione data_csv_parquet/produzione_giornaliera_classificata.csv --missing-calendar-mode daily
-    ```
-
-    (il missing-calendar-mode daily serve perché la pulizia stradale avviene ogni giorno)
-3. addestramento regressore SGD raggruppato per frazione e cluster:
-
-    ```bash
-    python model-training/regression/train_grouped_sgd_time_series_regressor.py --input data_csv_parquet/conferimenti_giornalieri_classificati.csv --split-ratios 80,10,10 --epochs 3 --batch-size 4096 --predictions-output predictions/sgd_test_predictions_grouped.parquet --progress
-    ```
-
-## GRAFO DIPENDENZE
-
-```mermaid
-flowchart TD
-    S1["train_kmeans.py"]
-    S2["distribuzione_giornaliera.py"]
-    S3["train_grouped_sgd_time_series_regressor.py"]
-
-    ANN_COSTR[/data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv/]
-    CAL[/data_csv_parquet/calendario_raccolta.csv/]
-    KMEANS_ASS[/data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv/]
-    KMEANS_MODEL[/models/kmeans_model_annuo_peso_coord.joblib/]
-    CONF_CLASS[/data_csv_parquet/conferimenti_giornalieri_classificati.csv/]
-    PROD[/data_csv_parquet/produzione_giornaliera_classificata.csv/]
-    SGD_MODEL[/models/grouped_sgd_time_series.joblib/]
-    SGD_METRICS[/grouped_sgd_time_series_metrics.csv/]
-    SGD_PRED[/predictions/sgd_test_predictions_grouped.parquet/]
-
-    ANN_COSTR --> S1
-    S1 --> KMEANS_ASS
-    S1 --> KMEANS_MODEL
-    KMEANS_ASS --> S2
-    CAL --> S2
-    S2 --> CONF_CLASS
-    S2 --> PROD
-    CONF_CLASS --> S3
-    S3 --> SGD_MODEL
-    S3 --> SGD_METRICS
-    S3 --> SGD_PRED
-
-    classDef script fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
-    classDef data fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
-    classDef source fill:#fff3e0,stroke:#ef6c00,color:#e65100
-
-    class S1,S2,S3 script
-    class KMEANS_ASS,KMEANS_MODEL,CONF_CLASS,PROD,SGD_MODEL,SGD_METRICS,SGD_PRED data
-    class ANN_COSTR,CAL source
-```
-
-| Step | Dipendenze in ingresso | Dipendenze in uscita |
-| --- | --- | --- |
-| 1 | `data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv` | `data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv`, `models/kmeans_model_annuo_peso_coord.joblib` |
-| 2 | `data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv`, `data_csv_parquet/calendario_raccolta.csv` | `data_csv_parquet/conferimenti_giornalieri_classificati.csv`, `data_csv_parquet/produzione_giornaliera_classificata.csv` |
-| 3 | `data_csv_parquet/conferimenti_giornalieri_classificati.csv` | `models/grouped_sgd_time_series.joblib`, `grouped_sgd_time_series_metrics.csv`, `predictions/sgd_test_predictions_grouped.parquet` |
-
-## ONNX inference service
-
-Install the exporter dependencies and convert the grouped scikit-learn bundle:
+Per provare un nuovo addestramento senza sovrascrivere modelli, metriche e dati
+generati già in uso, indicare una directory isolata:
 
 ```bash
+./run_pipeline.sh --source quantumleap \
+  --from-date 2024-01-01T00:00:00Z \
+  --to-date 2024-12-31T23:59:59Z \
+  --output-dir artifacts/prova-2024
+```
+
+`--output-dir` mantiene al suo interno la stessa struttura standard:
+
+```text
+artifacts/prova-2024/
+├── data_csv_parquet/     # output derivati della modalità file
+├── models/               # classificatore e regressore
+├── predictions/          # previsioni del test set
+└── grouped_sgd_time_series_metrics.csv
+```
+
+Gli input sorgente non vengono copiati o modificati. Gli snapshot QuantumLeap
+restano temporanei. Il flag isola soltanto i file locali: se viene aggiunto
+anche `--publish-orion`, i digital twin vengono comunque pubblicati in Orion.
+
+### Addestramento da QuantumLeap
+
+```bash
+./run_pipeline.sh --source quantumleap \
+  --from-date 2024-01-01 \
+  --to-date 2024-12-31
+```
+
+Le date senza orario indicano l'intera giornata in UTC: la data iniziale viene
+convertita in `00:00:00Z` e quella finale in `23:59:59Z`. Se si specifica anche
+l'orario, il fuso orario è obbligatorio, per esempio
+`2024-01-01T00:00:00+01:00` oppure `2024-01-01T00:00:00Z`.
+
+Il flusso QuantumLeap è:
+
+```text
+fetch storico
+→ aggregazione delle 13 frazioni per civico/anno
+→ addestramento K-means
+→ classificazione di ogni riga giornaliera
+→ addestramento regressore per frazione/cluster
+```
+
+Le frazioni note assenti vengono valorizzate a zero. Gli snapshot Parquet sono
+temporanei e vengono eliminati al termine. Poiché gli input sono ricreati a ogni
+esecuzione, la modalità QuantumLeap riaddestra entrambi i modelli ogni volta.
+
+`--ql-id-pattern` può limitare gli entity ID, ma il pattern deve includere tutte
+le entità-frazione necessarie per ottenere totali annuali corretti.
+
+### Addestramento e pubblicazione dei twin
+
+```bash
+./run_pipeline.sh --source quantumleap \
+  --from-date 2024-01-01T00:00:00Z \
+  --to-date 2024-12-31T23:59:59Z \
+  --publish-orion \
+  --forecast-from-date 2025-01-01 \
+  --forecast-to-date 2025-12-31
+```
+
+L'intervallo futuro deve iniziare dopo `--to-date`. La pipeline genera prima
+tutti i twin in uno snapshot temporaneo e pubblica in Orion solo se
+classificazione e regressione terminano correttamente.
+
+Output persistenti principali:
+
+| Output | Contenuto |
+| --- | --- |
+| `models/kmeans_model_annuo_peso_coord.joblib` | Modello K-means |
+| `models/grouped_sgd_time_series.joblib` | Regressori raggruppati |
+| `grouped_sgd_time_series_metrics.csv` | Metriche train/validation/test |
+| `predictions/sgd_test_predictions_grouped.parquet` | Previsioni sul test set |
+
+Per vedere il grafo senza eseguirlo:
+
+```bash
+./run_pipeline.sh --source quantumleap \
+  --from-date 2024-01-01T00:00:00Z \
+  --to-date 2024-12-31T23:59:59Z \
+  --print-graph
+```
+
+## Digital twin
+
+Viene creata un'entità per civico e anno:
+
+```text
+urn:ngsi-v2:RifiutiDigitalTwin:<id_civico>:<anno_previsione>
+```
+
+Contenuto principale:
+
+```json
+{
+  "id_civico": "2231596",
+  "forecast_year": 2025,
+  "classification_year": 2024,
+  "cluster_label": 3,
+  "cluster_distance": 0.42,
+  "classifier_model_version": "sha256...",
+  "regressor_model_version": "sha256...",
+  "forecast_from": "2025-01-01T00:00:00Z",
+  "forecast_to": "2025-12-31T23:59:59Z",
+  "future_values": [
+    {
+      "date": "2025-01-07",
+      "values_t": {"vetro": 0.25}
+    }
+  ]
+}
+```
+
+`future_values` contiene solo le date di conferimento previste dal calendario
+`data_csv_parquet/calendario_raccolta.csv`. Una nuova esecuzione aggiorna la
+stessa entità invece di crearne una duplicata.
+
+## Esportazione ONNX
+
+Installare le dipendenze degli esportatori nell'ambiente virtuale:
+
+```bash
+bin/python -m pip install -r onnx_clustering/requirements-export.txt
 bin/python -m pip install -r onnx_inference/requirements-export.txt
+```
+
+Esportare i due pacchetti:
+
+```bash
+bin/python onnx_clustering/export_model.py \
+  --input models/kmeans_model_annuo_peso_coord.joblib \
+  --output-dir .tmp/kmeans-onnx
+
 bin/python onnx_inference/export_models.py \
   --input models/grouped_sgd_time_series.joblib \
   --output-dir .tmp/grouped-sgd-onnx
 ```
 
-The output contains `manifest.json` and one ONNX model for every
-`frazione`/`cluster_label` group. The exporter refuses to overwrite an existing
-directory; use a new directory for each model version.
+Ogni directory contiene `manifest.json` e i modelli ONNX. Gli esportatori non
+sovrascrivono directory esistenti: usare una nuova directory per ogni versione.
+Classificatore e regressore devono provenire dalla stessa esecuzione di
+addestramento, perché le etichette dei cluster possono cambiare.
 
-Build and run the CPU inference container with the package mounted read-only:
+## Avvio dei servizi ONNX
 
-```bash
-docker build -f onnx_inference/Dockerfile -t waste-onnx-inference .
-docker run --rm -p 8000:8000 \
-  -v "$PWD/.tmp/grouped-sgd-onnx:/models:ro" \
-  waste-onnx-inference
-```
-
-Check readiness and request predictions:
-
-```bash
-curl http://localhost:8000/readyz
-curl -X POST http://localhost:8000/v1/predict \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "instances": [{
-      "data": "2024-09-10",
-      "anno_produzione": 2024,
-      "coord_x": 16.2896597,
-      "coord_y": 41.2407249,
-      "densita_locale": 384.0,
-      "giorni_accumulati": 3,
-      "zona_raccolta": 1,
-      "frazione": "altro_rd",
-      "cluster_label": 5
-    }]
-  }'
-```
-
-To deploy a new model, export it to a new directory and restart the container
-with that directory mounted at `/models`. The REST contract does not change.
-
-Run the exporter and API checks with:
-
-```bash
-bin/python -m pytest onnx_inference/test_inference.py
-```
-
-## ONNX clustering service
-
-Convert the annual K-means bundle into a versioned ONNX package:
-
-```bash
-bin/python -m pip install -r onnx_clustering/requirements-export.txt
-bin/python onnx_clustering/export_model.py \
-  --input models/kmeans_model_annuo_peso_coord.joblib \
-  --output-dir .tmp/kmeans-onnx
-```
-
-Build and run the standalone clustering service on host port 8001:
+Creare le immagini:
 
 ```bash
 docker build -f onnx_clustering/Dockerfile -t waste-onnx-clustering .
-docker run --rm -p 8001:8000 \
-  -v "$PWD/.tmp/kmeans-onnx:/models:ro" \
-  waste-onnx-clustering
+docker build -f onnx_inference/Dockerfile -t waste-onnx-inference .
 ```
 
-The service uses the same health, readiness, and batched prediction envelope as
-the regressor. The annual fields are required; `zona_costruzione` may be null.
+Esempio sulla rete Docker locale `fiware-quantumleap_fiware`:
+
+```bash
+docker run --rm --name waste-clustering \
+  --network fiware-quantumleap_fiware \
+  -p 8001:8000 \
+  -v "$PWD/.tmp/kmeans-onnx:/models:ro" \
+  -e QL_URL=http://fiware-quantumleap:8668 \
+  -e ORION_URL=http://fiware-orion:1026 \
+  -e FIWARE_SERVICE=openiot \
+  -e FIWARE_SERVICE_PATH=/ \
+  waste-onnx-clustering
+
+docker run --rm --name waste-regression \
+  --network fiware-quantumleap_fiware \
+  -p 8000:8000 \
+  -v "$PWD/.tmp/grouped-sgd-onnx:/models:ro" \
+  -e QL_URL=http://fiware-quantumleap:8668 \
+  -e ORION_URL=http://fiware-orion:1026 \
+  -e FIWARE_SERVICE=openiot \
+  -e FIWARE_SERVICE_PATH=/ \
+  waste-onnx-inference
+```
+
+Verificare lo stato:
 
 ```bash
 curl http://localhost:8001/readyz
-curl -X POST http://localhost:8001/v1/predict \
+curl http://localhost:8000/readyz
+```
+
+La documentazione interattiva FastAPI è disponibile su `/docs` per entrambi i
+servizi.
+
+## Inferenza ONNX da QuantumLeap
+
+Il flusso consigliato usa due chiamate esplicite.
+
+### 1. Classificare e pubblicare le etichette
+
+```bash
+curl -X POST http://localhost:8001/v1/predict/quantumleap \
   -H 'Content-Type: application/json' \
   -d '{
-    "instances": [{
-      "anno_produzione": 2024,
-      "coord_x": 16.3149866,
-      "coord_y": 41.2333986,
-      "densita_locale": 397,
-      "altro_rd_t": 4.47,
-      "carta_cartone_t": 76.623,
-      "frazione_organica_t": 266.098,
-      "ingombranti_misti_t": 139.054,
-      "legno_t": 0,
-      "metallo_t": 2.527,
-      "plastica_t": 22.206,
-      "pulizia_stradale_recupero_t": 0,
-      "raee_t": 0,
-      "rifiuti_cd_t": 0,
-      "selettiva_t": 0,
-      "tessili_t": 0,
-      "vetro_t": 28.849,
-      "zona_raccolta": 2,
-      "zona_costruzione": "B3R"
-    }]
+    "from_date": "2024-01-01T00:00:00Z",
+    "to_date": "2024-12-31T23:59:59Z",
+    "forecast_year": 2025,
+    "civic_ids": ["2231596"]
   }'
 ```
 
-The response contains `cluster_label` and the nearest-centroid
-`cluster_distance`. Pass the label to the grouped regressor. Because K-means
-labels can change after retraining, deploy clustering and regressor packages
-trained from the same assignments together.
+Il servizio legge tutti i record nel periodo, filtra i civici richiesti senza
+perdere le rispettive frazioni, aggrega per anno, esegue K-means e pubblica le
+etichette nei twin Orion. Omettendo `civic_ids` vengono elaborati tutti i civici
+del periodo richiesto. `forecast_year` identifica l'anno del digital twin; le
+date esatte dell'intervallo sono richieste soltanto dalla regressione.
 
-Run the clustering checks with:
+### 2. Calcolare e pubblicare le previsioni
+
+Eseguire questa chiamata dopo la precedente:
 
 ```bash
-bin/python -m pytest onnx_clustering/test_clustering.py
+curl -X POST http://localhost:8000/v1/forecast/quantumleap \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "from_date": "2024-01-01T00:00:00Z",
+    "to_date": "2024-12-31T23:59:59Z",
+    "forecast_from_date": "2025-01-01",
+    "forecast_to_date": "2025-01-31",
+    "civic_ids": ["2231596"]
+  }'
 ```
+
+Il regressore legge i dati sorgente e le etichette twin da QuantumLeap. Attende
+brevemente l'eventuale propagazione Orion → QuantumLeap, calcola i conferimenti
+futuri e aggiorna gli stessi twin in Orion.
+
+Altri endpoint disponibili:
+
+| Servizio | Endpoint | Uso |
+| --- | --- | --- |
+| Clustering | `POST /v1/predict` | Classificazione diretta di record annuali già preparati |
+| Regressione | `POST /v1/predict` | Regressione diretta di feature già preparate e classificate |
+| Regressione | `POST /v1/predict/quantumleap` | Previsione sulle righe storiche che possiedono già `cluster_label` |
+| Entrambi | `GET /healthz` | Processo attivo |
+| Entrambi | `GET /readyz` | Modello caricato e pronto |
+
+Codici di errore principali:
+
+| Codice | Significato |
+| --- | --- |
+| 404 | Nessun dato o nessuna etichetta twin disponibile |
+| 422 | Intervallo non valido, categoria o gruppo modello sconosciuto |
+| 502 | Risposta upstream o dati QuantumLeap malformati |
+| 504 | Timeout QuantumLeap o Orion |
+
+## Configurazione
+
+| Variabile | Predefinito | Utilizzata da |
+| --- | --- | --- |
+| `QL_URL` | `http://localhost:8668` | Pipeline e servizi |
+| `ENTITY_TYPE` | `RifiutiConferimento` | Pipeline e servizi |
+| `FIWARE_SERVICE` | `openiot` | Pipeline e servizi |
+| `FIWARE_SERVICE_PATH` | `/` | Pipeline e servizi |
+| `QL_TIMEOUT_SECONDS` | `30` | Pipeline e servizi |
+| `ORION_URL` | `http://localhost:1026` | Pipeline e servizi |
+| `ORION_TIMEOUT_SECONDS` | `30` | Pipeline e servizi |
+| `ORION_TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Pipeline di addestramento |
+| `TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Servizi ONNX |
+| `ORION_BATCH_SIZE` | `20` | Pipeline di addestramento |
+| `QL_LABEL_WAIT_SECONDS` | `5` | Regressore ONNX |
+| `FORECAST_CALENDAR` | calendario incluso | Pipeline e regressore ONNX |
+| `MODEL_DIR` | `/models` | Servizi ONNX |
+
+Le stesse configurazioni della pipeline possono essere fornite tramite opzioni
+`--ql-*`, `--fiware-*` e `--orion-*`. Consultare l'elenco completo con:
+
+```bash
+./run_pipeline.sh --help
+```
+
+## Test e verifica
+
+Suite completa senza servizi esterni:
+
+```bash
+bin/python -m pytest -q
+```
+
+Autoverifica del grafo di addestramento:
+
+```bash
+./run_pipeline.sh --self-check
+```
+
+Test di sistema con Orion e QuantumLeap locali:
+
+```bash
+RUN_ORION_INTEGRATION=1 \
+  bin/python -m pytest -q test_orion_integration.py
+```
+
+Il test di sistema crea tipi, entità e subscription temporanei, verifica il
+flusso Orion → QuantumLeap → ONNX clustering → twin → ONNX regressione e infine
+rimuove i dati di test.
+
+## Limiti operativi
+
+- Le richieste senza `civic_ids` devono comunque usare periodi temporali
+  ragionevolmente limitati.
+- La pipeline QuantumLeap riaddestra sempre i modelli; non riusa automaticamente
+  un modello esistente.
+- Pubblicare in Orion non avvia automaticamente la pipeline di addestramento.
+- Autenticazione aggiuntiva, retry automatici, creazione delle subscription e
+  deployment automatico dei nuovi modelli sono fuori dal flusso corrente.
+- La pubblicazione dei twin usa upsert deterministici: una riesecuzione aggiorna
+  il twin dello stesso civico/anno.

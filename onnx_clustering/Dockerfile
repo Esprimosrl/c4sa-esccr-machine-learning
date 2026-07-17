@@ -9,6 +9,7 @@ COPY onnx_clustering/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 app
 COPY onnx_clustering/app.py .
+COPY quantumleap.py inference_data.py orion.py .
 
 USER app
 EXPOSE 8000

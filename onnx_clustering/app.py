@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 import json
@@ -9,7 +10,11 @@ import os
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError
+
+from inference_data import DAILY_ATTRS, annual_rows, attribute, latest_annual, twin_id
+from orion import OrionError, OrionTimeout, publish_entities
+from quantumleap import QuantumLeapClient, QuantumLeapError, QuantumLeapTimeout, parse_datetime
 
 
 ANNUAL_FIELDS = (
@@ -66,6 +71,15 @@ class PredictionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     instances: list[PredictionInput] = Field(min_length=1)
+
+
+class QuantumLeapPredictionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    from_date: str
+    to_date: str
+    forecast_year: int
+    civic_ids: list[str] | None = Field(default=None, min_length=1)
 
 
 class UnknownCategory(ValueError):
@@ -244,6 +258,23 @@ class ModelPackage:
 async def lifespan(app: FastAPI):
     model_dir = Path(os.environ.get("MODEL_DIR", "/models"))
     app.state.model_package = ModelPackage.load(model_dir)
+    service = os.environ.get("FIWARE_SERVICE", "openiot")
+    service_path = os.environ.get("FIWARE_SERVICE_PATH", "/")
+    timeout = float(os.environ.get("QL_TIMEOUT_SECONDS", "30"))
+    app.state.quantumleap = QuantumLeapClient(
+        os.environ.get("QL_URL", "http://localhost:8668"),
+        os.environ.get("ENTITY_TYPE", "RifiutiConferimento"),
+        service,
+        service_path,
+        timeout,
+    )
+    app.state.orion = {
+        "url": os.environ.get("ORION_URL", "http://localhost:1026"),
+        "service": service,
+        "service_path": service_path,
+        "timeout": float(os.environ.get("ORION_TIMEOUT_SECONDS", "30")),
+        "entity_type": os.environ.get("TWIN_ENTITY_TYPE", "RifiutiDigitalTwin"),
+    }
     yield
 
 
@@ -281,4 +312,88 @@ def predict(payload: PredictionRequest, request: Request) -> dict:
             {"cluster_label": label, "cluster_distance": distance}
             for label, distance in values
         ],
+    }
+
+
+@app.post("/v1/predict/quantumleap")
+def predict_quantumleap(payload: QuantumLeapPredictionRequest, request: Request):
+    try:
+        if payload.forecast_year < parse_datetime(payload.to_date).year:
+            raise ValueError("Forecast year must not precede the observation range.")
+        rows = request.app.state.quantumleap.fetch(
+            list(DAILY_ATTRS), payload.from_date, payload.to_date
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except QuantumLeapTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except QuantumLeapError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not rows:
+        raise HTTPException(status_code=404, detail="No QuantumLeap records matched.")
+    try:
+        annual = annual_rows(rows, payload.civic_ids)
+        if not annual:
+            raise HTTPException(status_code=404, detail="No civics matched.")
+        instances = [
+            PredictionInput(**{name: row[name] for name in PredictionInput.model_fields})
+            for row in annual
+        ]
+        classified = {
+            (row["id_civico"], row["anno_produzione"]): prediction
+            for row, prediction in zip(
+                annual,
+                request.app.state.model_package.predict(instances),
+                strict=True,
+            )
+        }
+    except HTTPException:
+        raise
+    except UnknownCategory as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Malformed QuantumLeap data: {exc}") from exc
+
+    config = request.app.state.orion
+    observed = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    entities = []
+    predictions = []
+    for row in latest_annual(annual, payload.forecast_year):
+        label, distance = classified[(row["id_civico"], row["anno_produzione"])]
+        entity_id = twin_id(
+            config["entity_type"], row["id_civico"], payload.forecast_year
+        )
+        common = {
+            "id_civico": attribute(row["id_civico"], "Text"),
+            "forecast_year": attribute(payload.forecast_year, "Integer"),
+            "classification_year": attribute(row["anno_produzione"], "Integer"),
+            "cluster_label": attribute(label, "Integer"),
+            "cluster_distance": attribute(distance, "Number"),
+            "classifier_model_version": attribute(request.app.state.model_package.model_version, "Text"),
+            "dateObserved": attribute(observed, "DateTime"),
+        }
+        entities.append({"id": entity_id, "type": config["entity_type"], **common})
+        predictions.append({
+            "entity_id": entity_id,
+            "id_civico": row["id_civico"],
+            "forecast_year": payload.forecast_year,
+            "classification_year": row["anno_produzione"],
+            "cluster_label": label,
+            "cluster_distance": distance,
+        })
+    try:
+        publish_entities(
+            entities,
+            config["url"],
+            config["service"],
+            config["service_path"],
+            config["timeout"],
+        )
+    except OrionTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except OrionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "model_version": request.app.state.model_package.model_version,
+        "predictions": predictions,
     }

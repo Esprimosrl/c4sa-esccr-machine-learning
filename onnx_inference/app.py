@@ -2,16 +2,26 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 import json
 import math
 import os
+import time
 
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError
+
+from quantumleap import (
+    QuantumLeapClient,
+    QuantumLeapError,
+    QuantumLeapTimeout,
+    parse_datetime,
+)
+from inference_data import DAILY_ATTRS, annual_rows, attribute, forecast_events, latest_annual, split_years, twin_id
+from orion import OrionError, OrionTimeout, publish_entities
 
 
 SUPPORTED_FEATURES = {
@@ -53,6 +63,37 @@ class PredictionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     instances: list[PredictionInput] = Field(min_length=1)
+
+
+class QuantumLeapPredictionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    from_date: str
+    to_date: str
+    entity_ids: list[str] | None = None
+
+
+class QuantumLeapForecastRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    from_date: str
+    to_date: str
+    forecast_from_date: date
+    forecast_to_date: date
+    civic_ids: list[str] | None = Field(default=None, min_length=1)
+
+
+QUANTUMLEAP_FEATURES = [
+    "id_civico",
+    "frazione",
+    "anno_produzione",
+    "coord_x",
+    "coord_y",
+    "densita_locale",
+    "zona_raccolta",
+    "giorni_accumulati",
+    "cluster_label",
+]
 
 
 class UnknownGroup(ValueError):
@@ -211,6 +252,30 @@ class ModelPackage:
 async def lifespan(app: FastAPI):
     model_dir = Path(os.environ.get("MODEL_DIR", "/models"))
     app.state.model_package = ModelPackage.load(model_dir)
+    ql_url = os.environ.get("QL_URL", "http://localhost:8668")
+    service = os.environ.get("FIWARE_SERVICE", "openiot")
+    service_path = os.environ.get("FIWARE_SERVICE_PATH", "/")
+    timeout = float(os.environ.get("QL_TIMEOUT_SECONDS", "30"))
+    app.state.quantumleap = QuantumLeapClient(
+        ql_url,
+        os.environ.get("ENTITY_TYPE", "RifiutiConferimento"),
+        service,
+        service_path,
+        timeout,
+    )
+    twin_type = os.environ.get("TWIN_ENTITY_TYPE", "RifiutiDigitalTwin")
+    app.state.twin_quantumleap = QuantumLeapClient(
+        ql_url, twin_type, service, service_path, timeout
+    )
+    app.state.forecast = {
+        "calendar": Path(os.environ.get("FORECAST_CALENDAR", "/app/calendario_raccolta.csv")),
+        "label_wait": float(os.environ.get("QL_LABEL_WAIT_SECONDS", "5")),
+        "orion_url": os.environ.get("ORION_URL", "http://localhost:1026"),
+        "orion_timeout": float(os.environ.get("ORION_TIMEOUT_SECONDS", "30")),
+        "service": service,
+        "service_path": service_path,
+        "entity_type": twin_type,
+    }
     yield
 
 
@@ -248,3 +313,211 @@ def predict(
         "model_version": package.model_version,
         "predictions": [{"prediction_t": value} for value in values],
     }
+
+
+@app.post("/v1/predict/quantumleap")
+def predict_quantumleap(payload: QuantumLeapPredictionRequest, request: Request):
+    package = request.app.state.model_package
+    try:
+        rows = request.app.state.quantumleap.fetch(
+            QUANTUMLEAP_FEATURES,
+            payload.from_date,
+            payload.to_date,
+            entity_ids=payload.entity_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except QuantumLeapTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except QuantumLeapError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No QuantumLeap records matched.")
+    rows.sort(key=lambda row: (parse_datetime(row["timestamp"]), row["entity_id"]))
+    try:
+        instances = [
+            PredictionInput(
+                data=row["timestamp"].split("T", 1)[0],
+                anno_produzione=row["anno_produzione"],
+                coord_x=row["coord_x"],
+                coord_y=row["coord_y"],
+                densita_locale=row["densita_locale"],
+                giorni_accumulati=row["giorni_accumulati"],
+                zona_raccolta=row["zona_raccolta"],
+                frazione=row["frazione"],
+                cluster_label=row["cluster_label"],
+            )
+            for row in rows
+        ]
+        predictions = package.predict(instances)
+    except UnknownGroup as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"index": exc.index, "message": str(exc)},
+        ) from exc
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Malformed QuantumLeap data: {exc}"
+        ) from exc
+
+    return {
+        "model_version": package.model_version,
+        "predictions": [
+            {
+                "entity_id": row["entity_id"],
+                "timestamp": row["timestamp"],
+                "prediction_t": value,
+            }
+            for row, value in zip(rows, predictions, strict=True)
+        ],
+    }
+
+
+LABEL_FEATURES = [
+    "id_civico",
+    "forecast_year",
+    "classification_year",
+    "cluster_label",
+    "cluster_distance",
+    "classifier_model_version",
+]
+
+
+@app.post("/v1/forecast/quantumleap")
+def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
+    if payload.forecast_from_date > payload.forecast_to_date:
+        raise HTTPException(status_code=422, detail="Invalid forecast date range.")
+    try:
+        if payload.forecast_from_date <= parse_datetime(payload.to_date).date():
+            raise ValueError("Forecast dates must follow the observation range.")
+        rows = request.app.state.quantumleap.fetch(
+            list(DAILY_ATTRS), payload.from_date, payload.to_date
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except QuantumLeapTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except QuantumLeapError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not rows:
+        raise HTTPException(status_code=404, detail="No QuantumLeap records matched.")
+    try:
+        annual = annual_rows(rows, payload.civic_ids)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Malformed QuantumLeap data: {exc}") from exc
+    if not annual:
+        raise HTTPException(status_code=404, detail="No civics matched.")
+
+    config = request.app.state.forecast
+    targets = []
+    for year, year_start, year_end in split_years(
+        payload.forecast_from_date, payload.forecast_to_date
+    ):
+        for row in latest_annual(annual, year):
+            targets.append((row, year, year_start, year_end))
+    ids = [twin_id(config["entity_type"], row["id_civico"], year) for row, year, _, _ in targets]
+    deadline = time.monotonic() + max(config["label_wait"], 0)
+    labels = {}
+    try:
+        while True:
+            label_rows = request.app.state.twin_quantumleap.fetch_latest(
+                LABEL_FEATURES, id_pattern=".*"
+            )
+            labels = {row["entity_id"]: row for row in label_rows}
+            if all(entity_id in labels for entity_id in ids) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+    except QuantumLeapTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except QuantumLeapError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    missing = [entity_id for entity_id in ids if entity_id not in labels]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Missing digital-twin labels: {', '.join(missing)}")
+
+    model_fractions = sorted({fraction for fraction, _ in request.app.state.model_package.sessions})
+    events = forecast_events(
+        config["calendar"],
+        [row["zona_raccolta"] for row, _, _, _ in targets],
+        model_fractions,
+        payload.forecast_from_date,
+        payload.forecast_to_date,
+    )
+    instances = []
+    references = []
+    for row, year, _, _ in targets:
+        entity_id = twin_id(config["entity_type"], row["id_civico"], year)
+        label = int(labels[entity_id]["cluster_label"])
+        for event in events:
+            if event["zona_raccolta"] != str(row["zona_raccolta"]) or event["data"].year != year:
+                continue
+            if (event["frazione"], label) not in request.app.state.model_package.sessions:
+                continue
+            instances.append(PredictionInput(
+                data=event["data"],
+                anno_produzione=row["anno_produzione"],
+                coord_x=row["coord_x"],
+                coord_y=row["coord_y"],
+                densita_locale=row["densita_locale"],
+                giorni_accumulati=event["giorni_accumulati"],
+                zona_raccolta=int(row["zona_raccolta"]),
+                frazione=event["frazione"],
+                cluster_label=label,
+            ))
+            references.append((entity_id, event["data"], event["frazione"]))
+    try:
+        values = request.app.state.model_package.predict(instances)
+    except UnknownGroup as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    grouped: dict[str, dict[date, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+    for (entity_id, event_date, fraction), value in zip(references, values, strict=True):
+        grouped[entity_id][event_date][fraction] = value
+
+    observed = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    entities = []
+    predictions = []
+    for row, year, year_start, year_end in targets:
+        entity_id = twin_id(config["entity_type"], row["id_civico"], year)
+        label = labels[entity_id]
+        future_values = [
+            {"date": event_date.isoformat(), "values_t": fractions}
+            for event_date, fractions in sorted(grouped[entity_id].items())
+        ]
+        entity = {
+            "id": entity_id,
+            "type": config["entity_type"],
+            "id_civico": attribute(str(row["id_civico"]), "Text"),
+            "forecast_year": attribute(year, "Integer"),
+            "classification_year": attribute(int(label["classification_year"]), "Integer"),
+            "cluster_label": attribute(int(label["cluster_label"]), "Integer"),
+            "cluster_distance": attribute(float(label["cluster_distance"]), "Number"),
+            "classifier_model_version": attribute(str(label["classifier_model_version"]), "Text"),
+            "regressor_model_version": attribute(request.app.state.model_package.model_version, "Text"),
+            "forecast_from": attribute(f"{year_start.isoformat()}T00:00:00Z", "DateTime"),
+            "forecast_to": attribute(f"{year_end.isoformat()}T23:59:59Z", "DateTime"),
+            "dateObserved": attribute(observed, "DateTime"),
+            "future_values": attribute(future_values, "StructuredValue"),
+        }
+        entities.append(entity)
+        predictions.append({
+            "entity_id": entity_id,
+            "id_civico": str(row["id_civico"]),
+            "forecast_year": year,
+            "classification_year": int(label["classification_year"]),
+            "cluster_label": int(label["cluster_label"]),
+            "future_values": future_values,
+        })
+    try:
+        publish_entities(
+            entities,
+            config["orion_url"],
+            config["service"],
+            config["service_path"],
+            config["orion_timeout"],
+        )
+    except OrionTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except OrionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"model_version": request.app.state.model_package.model_version, "predictions": predictions}
