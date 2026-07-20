@@ -223,6 +223,80 @@ Linux, `--user` fa sì che gli artefatti nei bind mount appartengano all'utente
 che avvia il container; senza override l'immagine usa l'utente non privilegiato
 `app` (UID 10001).
 
+### API di addestramento on demand
+
+Il target `api` della stessa immagine espone la pipeline tramite FastAPI senza
+modificare il comportamento predefinito dell'immagine batch:
+
+```bash
+docker build --target api -f model-training/Dockerfile \
+  -t waste-model-training-api .
+
+mkdir -p "$PWD/artifacts"
+docker run --rm \
+  --name waste-model-training-api \
+  --user "$(id -u):$(id -g)" \
+  --network fiware-quantumleap_fiware \
+  -p 8002:8000 \
+  -e QL_URL=http://fiware-quantumleap:8668 \
+  -e ORION_URL=http://fiware-orion:1026 \
+  -e FIWARE_SERVICE=openiot \
+  -e FIWARE_SERVICE_PATH=/ \
+  -v "$PWD/data_csv_parquet:/data:ro" \
+  -v "$PWD/artifacts:/artifacts" \
+  waste-model-training-api
+```
+
+Avviare un job usando file locali al nodo/container:
+
+```bash
+curl -X POST http://localhost:8002/v1/training-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source": "file",
+    "year": 2024,
+    "seed": 42,
+    "annual_input_path": "/data/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+    "calendar_input_path": "/data/calendario_raccolta.csv",
+    "output_dir": "/artifacts/file-2024",
+    "force": false
+  }'
+```
+
+Oppure leggere lo storico da QuantumLeap e, facoltativamente, pubblicare i
+digital twin in Orion:
+
+```bash
+curl -X POST http://localhost:8002/v1/training-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source": "quantumleap",
+    "seed": 42,
+    "from_date": "2024-01-01",
+    "to_date": "2024-12-31",
+    "output_dir": "/artifacts/quantumleap-2024",
+    "orion": {
+      "forecast_from_date": "2025-01-01",
+      "forecast_to_date": "2025-12-31",
+      "forecast_calendar_path": "/data/calendario_raccolta.csv"
+    }
+  }'
+```
+
+La risposta `202 Accepted` contiene `job_id`. Consultare lo stato con:
+
+```bash
+curl http://localhost:8002/v1/training-jobs/JOB_ID
+curl http://localhost:8002/healthz
+```
+
+Gli stati sono `queued`, `running`, `succeeded` e `failed`. Il servizio accetta
+un solo job attivo e risponde `409` alle richieste concorrenti. Gli ID e gli
+stati restano in memoria e vengono persi al riavvio. I percorsi relativi sono
+risolti rispetto alla radice del progetto; i percorsi assoluti sono limitati
+dai permessi del processo e dai mount del container. Il servizio verifica che
+`output_dir` sia creabile e scrivibile prima di accettare il job.
+
 ### Addestramento da QuantumLeap
 
 ```bash

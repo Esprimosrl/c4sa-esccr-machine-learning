@@ -36,6 +36,11 @@ def artifact(output_dir: Path | None, path: str) -> Path:
     return output_dir / path
 
 
+def local_path(path: Path | None, default: str) -> Path:
+    resolved = path or Path(default)
+    return resolved if resolved.is_absolute() else rel(str(resolved))
+
+
 def normalize_training_range(from_date: str, to_date: str) -> tuple[str, str]:
     def normalize(value: str, end: bool) -> str:
         try:
@@ -60,8 +65,20 @@ def normalize_training_range(from_date: str, to_date: str) -> tuple[str, str]:
 
 
 def build_graph(
-    python: str, seed: str, anno: str, output_dir: Path | None = None
+    python: str,
+    seed: str,
+    anno: str,
+    output_dir: Path | None = None,
+    annual_input: Path | None = None,
+    calendar_input: Path | None = None,
 ) -> dict[str, Node]:
+    annual_input = local_path(
+        annual_input,
+        "data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+    )
+    calendar_input = local_path(
+        calendar_input, "data_csv_parquet/calendario_raccolta.csv"
+    )
     assignments = artifact(
         output_dir, "data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv"
     )
@@ -88,7 +105,7 @@ def build_graph(
                 python,
                 "model-training/classification/train_kmeans.py",
                 "--input",
-                "data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+                str(annual_input),
                 "--n-clusters",
                 "6",
                 "--output",
@@ -105,12 +122,10 @@ def build_graph(
                 "1",
                 "--categorical-weight",
                 "1",
+                "--seed",
+                seed,
             ],
-            inputs=(
-                rel(
-                    "data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv"
-                ),
-            ),
+            inputs=(annual_input,),
             outputs=(
                 assignments,
                 classifier_model,
@@ -126,7 +141,7 @@ def build_graph(
                 "--anno",
                 anno,
                 "--calendario",
-                "data_csv_parquet/calendario_raccolta.csv",
+                str(calendar_input),
                 "--id-col",
                 "id_civico",
                 "--zona-col",
@@ -142,7 +157,7 @@ def build_graph(
             ],
             inputs=(
                 assignments,
-                rel("data_csv_parquet/calendario_raccolta.csv"),
+                calendar_input,
             ),
             outputs=(classified, production),
             needs=("kmeans",),
@@ -166,6 +181,8 @@ def build_graph(
                 str(regressor_model),
                 "--metrics-output",
                 str(metrics),
+                "--seed",
+                seed,
                 "--progress",
             ],
             inputs=(classified,),
@@ -306,6 +323,8 @@ def build_quantumleap_graph(
                 str(regressor_model),
                 "--metrics-output",
                 str(metrics),
+                "--seed",
+                seed,
                 "--progress",
             ],
             (classified,),
@@ -412,7 +431,7 @@ def run_graph(graph: dict[str, Node], force: bool, dry_run: bool) -> None:
 
     for node in topo_sort(graph):
         missing_inputs = [
-            str(path.relative_to(ROOT))
+            str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path)
             for path in node.inputs
             if not path.exists() and (not dry_run or path not in graph_outputs)
         ]
