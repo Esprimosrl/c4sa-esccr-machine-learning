@@ -6,6 +6,9 @@ import math
 import joblib
 import numpy as np
 import pytest
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 from onnx_inference.app import (
     ModelPackage,
@@ -110,3 +113,110 @@ def test_package_routes_groups_and_matches_sklearn(model_dir: Path) -> None:
 def test_missing_package_fails(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         ModelPackage.load(tmp_path)
+
+
+def test_gpr_bundle_exports_to_onnx(tmp_path: Path) -> None:
+    numeric_cols = [
+        "coord_x",
+        "coord_y",
+        "densita_locale",
+        "giorni_accumulati",
+        "anno_ref",
+        "month",
+        "day_of_month",
+        "day_of_year",
+        "day_of_week",
+        "week_of_year",
+        "quarter",
+        "season_sin",
+        "season_cos",
+    ]
+    feature_names = numeric_cols + [f"zona_raccolta={level}" for level in range(1, 5)]
+    rng = np.random.default_rng(42)
+    features = rng.normal(size=(20, len(feature_names))).astype(np.float32)
+    target = rng.normal(size=20)
+    estimator = GaussianProcessRegressor(
+        kernel=(
+            ConstantKernel(1.0, (1e-2, 1e2))
+            * RBF(1.0, (1e-2, 1e2))
+            + WhiteKernel(0.1, (1e-5, 1e1))
+        ),
+        alpha=1e-6,
+        normalize_y=True,
+        random_state=42,
+    ).fit(features, target)
+    source = tmp_path / "grouped_gpr.joblib"
+    joblib.dump(
+        {
+            "model_name": "grouped_gpr",
+            "numeric_cols": numeric_cols,
+            "feature_names": feature_names,
+            "models": {
+                "frazione=vetro|cluster_label=0": {
+                    "model": estimator,
+                    "numeric_stats": {name: (0.0, 1.0) for name in numeric_cols},
+                    "group_values": {"frazione": "vetro", "cluster_label": "0"},
+                    "prediction_upper_bound_t": 0.05,
+                }
+            },
+        },
+        source,
+    )
+
+    output = tmp_path / "package"
+    manifest = export_bundle(source, output)
+
+    assert len(manifest["groups"]) == 1
+    assert manifest["groups"][0]["prediction_upper_bound_t"] == 0.05
+    assert (output / "models/000.onnx").exists()
+
+
+def test_hist_gradient_boosting_bundle_exports_to_onnx(tmp_path: Path) -> None:
+    numeric_cols = [
+        "coord_x",
+        "coord_y",
+        "densita_locale",
+        "giorni_accumulati",
+        "anno_ref",
+        "month",
+        "day_of_month",
+        "day_of_year",
+        "day_of_week",
+        "week_of_year",
+        "quarter",
+        "season_sin",
+        "season_cos",
+    ]
+    feature_names = numeric_cols + [f"zona_raccolta={level}" for level in range(1, 5)]
+    rng = np.random.default_rng(42)
+    features = rng.normal(size=(100, len(feature_names))).astype(np.float32)
+    target = np.exp(rng.normal(size=100))
+    estimator = HistGradientBoostingRegressor(
+        loss="poisson",
+        max_iter=5,
+        min_samples_leaf=2,
+        random_state=42,
+    ).fit(features, target)
+    source = tmp_path / "grouped_hist.joblib"
+    joblib.dump(
+        {
+            "model_name": "grouped_hist_gradient_boosting",
+            "target_transform": "identity",
+            "numeric_cols": numeric_cols,
+            "feature_names": feature_names,
+            "models": {
+                "frazione=vetro|cluster_label=0": {
+                    "model": estimator,
+                    "numeric_stats": {name: (0.0, 1.0) for name in numeric_cols},
+                    "group_values": {"frazione": "vetro", "cluster_label": "0"},
+                }
+            },
+        },
+        source,
+    )
+
+    output = tmp_path / "hist-package"
+    manifest = export_bundle(source, output)
+
+    assert len(manifest["groups"]) == 1
+    assert (output / "models/000.onnx").exists()

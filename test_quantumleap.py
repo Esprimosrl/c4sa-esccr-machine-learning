@@ -38,6 +38,12 @@ from onnx_inference.app import (
     predict_quantumleap,
 )
 from onnx_inference.export_models import export_bundle as export_regression_bundle
+from dataset.distribuzione_giornaliera import (
+    FRACTION_BY_LABEL,
+    fraction_salt,
+    process_fraction,
+)
+from lag_features import LAG_FEATURES, LagState
 
 
 ROOT = Path(__file__).parent
@@ -54,6 +60,14 @@ def load_module(name: str, path: str):
 
 prepare = load_module("prepare_quantumleap", "model-training/prepare_quantumleap.py")
 pipeline = load_module("ml_pipeline_graph", "model-training/ml_pipeline_graph.py")
+trainer = load_module(
+    "grouped_regressor_trainer",
+    "model-training/regression/train_grouped_sgd_time_series_regressor.py",
+)
+autocorrelation_plot = load_module(
+    "plot_group_autocorrelation",
+    "model-training/regression/plot_group_autocorrelation.py",
+)
 publisher = load_module(
     "publish_digital_twins", "model-training/publish_digital_twins.py"
 )
@@ -87,6 +101,137 @@ def entity(entity_id="a/b", indexes=None, **attrs):
 
 def client():
     return QuantumLeapClient("http://ql/base/", "Waste Type/1", "tenant", "/andria", 2)
+
+
+def test_fraction_salt_is_stable_and_seeded():
+    assert fraction_salt("ingombranti_misti", 42) == 33385
+    assert fraction_salt("ingombranti_misti", 43) == 12179
+
+
+def test_daily_generation_includes_historical_quantity_features(tmp_path):
+    annual = tmp_path / "annual.csv"
+    pd.DataFrame(
+        [
+            {
+                "id_civico": "1",
+                "coord_x": 16.3,
+                "coord_y": 41.2,
+                "densita_locale": 100,
+                "vetro_t": 366.0,
+            }
+        ]
+    ).to_csv(annual, index=False)
+    parts = tmp_path / "parts"
+    parts.mkdir()
+    output, _ = process_fraction(
+        SimpleNamespace(
+            annuo=str(annual),
+            annuo_separator=",",
+            id_col="id_civico",
+            zona_col="zona_raccolta",
+            zona_default="1",
+            anno=2024,
+            seed=42,
+            spillover_days=14,
+            missing_calendar_mode="daily",
+            force_year_end=True,
+            round_decimals=3,
+        ),
+        FRACTION_BY_LABEL["vetro"],
+        list(pd.read_csv(annual, nrows=0).columns),
+        [],
+        ["1"],
+        parts,
+        None,
+    )
+    generated = pd.read_csv(output)
+    assert generated["historical_annual_t"].eq(366.0).all()
+    assert generated["historical_collection_mean_t"].eq(1.0).all()
+
+
+def test_lag_features_are_strictly_historical():
+    state = LagState()
+    state.add("1", "vetro", "2024-01-01", 2.0)
+    state.add("1", "vetro", "2024-01-08", 4.0)
+
+    features = state.features("1", "vetro", "2024-01-31")
+    assert features == {
+        "lag_1_collection_t": 4.0,
+        "rolling_7d_sum_t": 0.0,
+        "rolling_30d_sum_t": 6.0,
+        "rolling_90d_median_t": 3.0,
+        "rolling_90d_count": 2.0,
+        "days_since_last_nonzero_collection": 23.0,
+    }
+
+
+def test_group_autocorrelation_fills_missing_calendar_days():
+    daily = pd.DataFrame(
+        {
+            "frazione": ["vetro", "vetro"],
+            "cluster_label": ["0", "0"],
+            "data": pd.to_datetime(["2024-01-01", "2024-01-03"]),
+            "conferimento_t": [1.0, 1.0],
+        }
+    )
+
+    result = autocorrelation_plot.compute_autocorrelations(daily, max_lag=2)
+
+    assert result["observations"].tolist() == [3, 3, 3]
+    assert result["autocorrelation"].tolist() == pytest.approx(
+        [1.0, -2 / 3, 1 / 6]
+    )
+
+
+def test_recursive_validation_uses_predictions_not_held_out_targets():
+    con = duckdb.connect()
+    rows = pd.DataFrame(
+        {
+            "__row_id": [1, 2, 3, 4],
+            "__time_rank": [1, 2, 3, 4],
+            "id_civico": "1",
+            "data_dt": pd.to_datetime(
+                ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+            ),
+            "frazione": "vetro",
+            "__group_frazione": "vetro",
+            "__group_cluster_label": "0",
+            "target_value": [1.0, 2.0, 100.0, 100.0],
+            "lag_1_collection_t": [0.0, 1.0, 2.0, 100.0],
+        }
+    )
+    con.register("rows", rows)
+    con.execute("CREATE TABLE full_data AS SELECT * FROM rows")
+    con.execute("CREATE TABLE train_data AS SELECT * FROM rows WHERE __time_rank <= 2")
+    con.execute("CREATE TABLE validation_data AS SELECT * FROM rows WHERE __time_rank > 2")
+
+    class PreviousValueModel:
+        def predict(self, features):
+            return features[:, 0]
+
+    _, predictions, _ = trainer.recursive_group_predictions(
+        con,
+        PreviousValueModel(),
+        trainer.GroupSpec("vetro|0", "vetro", "0", 2),
+        "validation",
+        "id_civico",
+        ["lag_1_collection_t"],
+        ["lag_1_collection_t"],
+        [],
+        {"lag_1_collection_t": (0.0, 1.0)},
+        "identity",
+        100.0,
+    )
+    assert predictions.tolist() == [2.0, 2.0]
+
+
+def test_log_prediction_cap_prevents_recursive_overflow():
+    predictions = trainer.prediction_log_to_raw(
+        pd.Series([1_000.0, float("inf"), float("nan")]),
+        upper_bound=25.0,
+    )
+
+    assert predictions.tolist() == [25.0, 25.0, 0.0]
 
 
 def test_client_encodes_query_headers_and_paginates(monkeypatch):
@@ -259,6 +404,31 @@ def test_pipeline_modes_preserve_file_graph_and_order_quantumleap(tmp_path):
         output_dir / "grouped_sgd_time_series_metrics.csv",
         output_dir / "predictions/sgd_test_predictions_grouped.parquet",
     )
+    gpr_graph = pipeline.build_graph(
+        "python",
+        "42",
+        "2024",
+        output_dir,
+        regressor="gpr",
+        gpr_max_train_rows=123,
+    )
+    assert gpr_graph["grouped_gpr"].outputs == (
+        output_dir / "models/grouped_gpr_time_series.joblib",
+        output_dir / "grouped_gpr_time_series_metrics.csv",
+        output_dir / "predictions/gpr_test_predictions_grouped.parquet",
+    )
+    gpr_command = gpr_graph["grouped_gpr"].command
+    assert gpr_command[gpr_command.index("--regressor") + 1] == "gpr"
+    assert gpr_command[gpr_command.index("--gpr-max-train-rows") + 1] == "123"
+    hist_graph = pipeline.build_graph(
+        "python", "42", "2024", output_dir, regressor="hist_gradient_boosting"
+    )
+    assert hist_graph["grouped_hist_gradient_boosting"].outputs == (
+        output_dir / "models/grouped_hist_gradient_boosting_time_series.joblib",
+        output_dir / "grouped_hist_gradient_boosting_time_series_metrics.csv",
+        output_dir
+        / "predictions/hist_gradient_boosting_test_predictions_grouped.parquet",
+    )
     args = SimpleNamespace(
         from_date="2024-01-01T00:00:00Z",
         to_date="2024-12-31T23:59:59Z",
@@ -301,6 +471,73 @@ def test_pipeline_modes_preserve_file_graph_and_order_quantumleap(tmp_path):
         in publish.command
     )
     assert str(output_dir / "models/grouped_sgd_time_series.joblib") in publish.command
+
+
+def test_gpr_sampling_is_capped_deterministic_and_time_stratified():
+    con = duckdb.connect()
+    con.execute("""
+        CREATE TABLE train_data AS
+        SELECT
+            value AS __time_rank,
+            'vetro' AS __group_frazione,
+            '0' AS __group_cluster_label,
+            value * 10 AS target_value
+        FROM range(1, 21) rows(value);
+    """)
+    group = trainer.GroupSpec("vetro|0", "vetro", "0", 20)
+
+    first = trainer.fetch_gpr_sample(con, group, ["target_value"], 5, 42)
+    second = trainer.fetch_gpr_sample(con, group, ["target_value"], 5, 42)
+
+    assert first.equals(second)
+    assert len(first) == 5
+    assert sorted((first["__time_rank"] - 1) // 4) == [0, 1, 2, 3, 4]
+
+    small_group = trainer.GroupSpec("vetro|0", "vetro", "0", 20)
+    assert len(
+        trainer.fetch_gpr_sample(con, small_group, ["target_value"], 25, 42)
+    ) == 20
+
+
+def test_histogram_booster_accepts_an_all_zero_validation_group():
+    con = duckdb.connect()
+    train = pd.DataFrame(
+        {
+            "__time_rank": range(1, 41),
+            "__group_frazione": "rifiuti_cd",
+            "__group_cluster_label": "3",
+            "coord_x": range(40),
+            "zona_raccolta": "1",
+            "target_value": [0.0, 1.0] * 20,
+        }
+    )
+    validation = train.iloc[:10].copy()
+    validation["target_value"] = 0.0
+    con.register("train_source", train)
+    con.register("validation_source", validation)
+    con.execute("CREATE TABLE train_data AS SELECT * FROM train_source")
+    con.execute("CREATE TABLE validation_data AS SELECT * FROM validation_source")
+    group = trainer.GroupSpec("rifiuti_cd|3", "rifiuti_cd", "3", len(train))
+    model = trainer.HistGradientBoostingRegressor(
+        loss="poisson",
+        max_iter=5,
+        min_samples_leaf=2,
+        early_stopping=True,
+        random_state=42,
+    )
+
+    fit_rows = trainer.fit_hist_gradient_boosting(
+        con,
+        model,
+        group,
+        ["coord_x", "zona_raccolta"],
+        ["coord_x"],
+        ["zona_raccolta"],
+        {"coord_x": (19.5, 12.0)},
+    )
+
+    assert fit_rows == 40
+    assert model.early_stopping is False
 
 
 def test_pipeline_dry_run_allows_uncreated_intermediate_outputs(tmp_path, capsys):
@@ -508,6 +745,14 @@ def test_tiny_training_pipeline_classifies_then_trains_regressor(tmp_path):
     assert len(classified) == len(daily)
     assert classified["cluster_label"].notna().all()
     assert classified["cluster_label"].nunique() == 2
+    first_history = classified[classified["id_civico"] == "0"]
+    assert first_history["historical_annual_t"].nunique() == 1
+    assert first_history["historical_annual_t"].iat[0] == pytest.approx(
+        first_history["conferimento_t"].sum()
+    )
+    assert first_history["historical_collection_mean_t"].iat[0] == pytest.approx(
+        first_history["conferimento_t"].mean()
+    )
 
     classified_path = tmp_path / "classified.parquet"
     regressor_model = tmp_path / "regressor.joblib"
@@ -539,11 +784,113 @@ def test_tiny_training_pipeline_classifies_then_trains_regressor(tmp_path):
 
     bundle = joblib.load(regressor_model)
     assert len(bundle["models"]) == 2
+    assert "historical_annual_t" in bundle["numeric_cols"]
+    assert "historical_collection_mean_t" in bundle["numeric_cols"]
+    assert set(LAG_FEATURES) <= set(bundle["numeric_cols"])
+    assert all(
+        info["prediction_upper_bound_t"] > 0
+        for info in bundle["models"].values()
+    )
     assert metrics_path.exists()
     prediction_count = duckdb.connect().execute(
         "SELECT count(*) FROM read_parquet(?)", [str(predictions_path)]
     ).fetchone()[0]
     assert prediction_count > 0
+
+    gpr_model = tmp_path / "gpr.joblib"
+    gpr_metrics = tmp_path / "gpr_metrics.csv"
+    gpr_predictions = tmp_path / "gpr_predictions.parquet"
+    subprocess.run(
+        [
+            sys.executable,
+            "model-training/regression/train_grouped_sgd_time_series_regressor.py",
+            "--regressor",
+            "gpr",
+            "--gpr-max-train-rows",
+            "10",
+            "--input",
+            str(classified_path),
+            "--split-ratios",
+            "60,20,20",
+            "--batch-size",
+            "32",
+            "--model-output",
+            str(gpr_model),
+            "--metrics-output",
+            str(gpr_metrics),
+            "--predictions-output",
+            str(gpr_predictions),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    gpr_bundle = joblib.load(gpr_model)
+    assert gpr_bundle["model_name"] == "grouped_gpr"
+    assert len(gpr_bundle["models"]) == 2
+    assert all(info["fit_rows"] <= 10 for info in gpr_bundle["models"].values())
+    assert gpr_metrics.exists()
+    assert gpr_predictions.exists()
+
+    twins = tmp_path / "gpr_twins.jsonl"
+    assert publisher.stage_twins(
+        assignments_path,
+        kmeans_model,
+        gpr_model,
+        ROOT / "data_csv_parquet/calendario_raccolta.csv",
+        publisher.parse_day("2025-01-01"),
+        publisher.parse_day("2025-01-07"),
+        "RifiutiDigitalTwin",
+        twins,
+        classified_path,
+    ) == len(assignments)
+
+    hist_model = tmp_path / "hist.joblib"
+    hist_metrics = tmp_path / "hist_metrics.csv"
+    hist_predictions = tmp_path / "hist_predictions.parquet"
+    subprocess.run(
+        [
+            sys.executable,
+            "model-training/regression/train_grouped_sgd_time_series_regressor.py",
+            "--regressor",
+            "hist_gradient_boosting",
+            "--input",
+            str(classified_path),
+            "--split-ratios",
+            "60,20,20",
+            "--batch-size",
+            "32",
+            "--model-output",
+            str(hist_model),
+            "--metrics-output",
+            str(hist_metrics),
+            "--predictions-output",
+            str(hist_predictions),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    hist_bundle = joblib.load(hist_model)
+    assert hist_bundle["model_name"] == "grouped_hist_gradient_boosting"
+    assert hist_bundle["target_transform"] == "identity"
+    assert len(hist_bundle["models"]) == 2
+    assert all(
+        info["fit_rows"] == info["train_rows"]
+        for info in hist_bundle["models"].values()
+    )
+    hist_twins = tmp_path / "hist_twins.jsonl"
+    assert publisher.stage_twins(
+        assignments_path,
+        kmeans_model,
+        hist_model,
+        ROOT / "data_csv_parquet/calendario_raccolta.csv",
+        publisher.parse_day("2025-01-01"),
+        publisher.parse_day("2025-01-07"),
+        "RifiutiDigitalTwin",
+        hist_twins,
+        classified_path,
+    ) == len(assignments)
 
 
 def test_existing_models_classify_then_regress(tmp_path):
@@ -650,6 +997,7 @@ def feature_row(entity_id, timestamp, cluster=1):
         "zona_raccolta": 1,
         "giorni_accumulati": 2,
         "cluster_label": cluster,
+        "conferimento_t": 1.0,
     }
 
 

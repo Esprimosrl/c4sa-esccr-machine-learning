@@ -149,6 +149,11 @@ def join_clusters(daily: pd.DataFrame, assignments: pd.DataFrame) -> pd.DataFram
     )
     if classified["cluster_label"].isna().any() or len(classified) != len(daily):
         raise ValueError("Every daily row must have exactly one fresh cluster assignment.")
+    history_groups = classified.groupby(
+        ["id_civico", "anno_produzione", "frazione"], dropna=False
+    )["conferimento_t"]
+    classified["historical_annual_t"] = history_groups.transform("sum")
+    classified["historical_collection_mean_t"] = history_groups.transform("mean")
     return classified
 
 

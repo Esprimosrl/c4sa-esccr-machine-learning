@@ -22,6 +22,7 @@ from quantumleap import (
 )
 from inference_data import DAILY_ATTRS, annual_rows, attribute, forecast_events, latest_annual, split_years, twin_id
 from orion import OrionError, OrionTimeout, publish_entities
+from lag_features import LAG_FEATURES, LagState
 
 
 SUPPORTED_FEATURES = {
@@ -29,6 +30,9 @@ SUPPORTED_FEATURES = {
     "coord_y",
     "densita_locale",
     "giorni_accumulati",
+    "historical_annual_t",
+    "historical_collection_mean_t",
+    *LAG_FEATURES,
     "anno_ref",
     "month",
     "day_of_month",
@@ -54,6 +58,14 @@ class PredictionInput(BaseModel):
     coord_y: FiniteFloat
     densita_locale: FiniteFloat
     giorni_accumulati: FiniteFloat
+    historical_annual_t: FiniteFloat = Field(default=0, ge=0)
+    historical_collection_mean_t: FiniteFloat = Field(default=0, ge=0)
+    lag_1_collection_t: FiniteFloat = Field(default=0, ge=0)
+    rolling_7d_sum_t: FiniteFloat = Field(default=0, ge=0)
+    rolling_30d_sum_t: FiniteFloat = Field(default=0, ge=0)
+    rolling_90d_median_t: FiniteFloat = Field(default=0, ge=0)
+    rolling_90d_count: FiniteFloat = Field(default=0, ge=0)
+    days_since_last_nonzero_collection: FiniteFloat = Field(default=0, ge=0)
     zona_raccolta: int = Field(ge=1, le=4)
     frazione: str = Field(min_length=1)
     cluster_label: int
@@ -93,6 +105,7 @@ QUANTUMLEAP_FEATURES = [
     "zona_raccolta",
     "giorni_accumulati",
     "cluster_label",
+    "conferimento_t",
 ]
 
 
@@ -114,6 +127,18 @@ def feature_values(instance: PredictionInput) -> dict[str, float]:
         "coord_y": float(instance.coord_y),
         "densita_locale": float(instance.densita_locale),
         "giorni_accumulati": float(instance.giorni_accumulati),
+        "historical_annual_t": float(instance.historical_annual_t),
+        "historical_collection_mean_t": float(
+            instance.historical_collection_mean_t
+        ),
+        "lag_1_collection_t": float(instance.lag_1_collection_t),
+        "rolling_7d_sum_t": float(instance.rolling_7d_sum_t),
+        "rolling_30d_sum_t": float(instance.rolling_30d_sum_t),
+        "rolling_90d_median_t": float(instance.rolling_90d_median_t),
+        "rolling_90d_count": float(instance.rolling_90d_count),
+        "days_since_last_nonzero_collection": float(
+            instance.days_since_last_nonzero_collection
+        ),
         "anno_ref": float(instance.anno_produzione),
         "month": float(value_date.month),
         "day_of_month": float(value_date.day),
@@ -336,21 +361,42 @@ def predict_quantumleap(payload: QuantumLeapPredictionRequest, request: Request)
         raise HTTPException(status_code=404, detail="No QuantumLeap records matched.")
     rows.sort(key=lambda row: (parse_datetime(row["timestamp"]), row["entity_id"]))
     try:
-        instances = [
-            PredictionInput(
-                data=row["timestamp"].split("T", 1)[0],
-                anno_produzione=row["anno_produzione"],
-                coord_x=row["coord_x"],
-                coord_y=row["coord_y"],
-                densita_locale=row["densita_locale"],
-                giorni_accumulati=row["giorni_accumulati"],
-                zona_raccolta=row["zona_raccolta"],
-                frazione=row["frazione"],
-                cluster_label=row["cluster_label"],
-            )
-            for row in rows
-        ]
-        predictions = package.predict(instances)
+        predictions = [0.0] * len(rows)
+        lag_state = LagState()
+        positions_by_date: dict[str, list[int]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            positions_by_date[row["timestamp"].split("T", 1)[0]].append(index)
+        for event_day, positions in positions_by_date.items():
+            instances = []
+            for index in positions:
+                row = rows[index]
+                lag_values = lag_state.features(
+                    row["id_civico"], row["frazione"], event_day
+                )
+                instances.append(
+                    PredictionInput(
+                        data=event_day,
+                        anno_produzione=row["anno_produzione"],
+                        coord_x=row["coord_x"],
+                        coord_y=row["coord_y"],
+                        densita_locale=row["densita_locale"],
+                        giorni_accumulati=row["giorni_accumulati"],
+                        zona_raccolta=row["zona_raccolta"],
+                        frazione=row["frazione"],
+                        cluster_label=row["cluster_label"],
+                        **lag_values,
+                    )
+                )
+            batch_predictions = package.predict(instances)
+            for index, prediction in zip(positions, batch_predictions, strict=True):
+                predictions[index] = prediction
+                row = rows[index]
+                lag_state.add(
+                    row["id_civico"],
+                    row["frazione"],
+                    event_day,
+                    row["conferimento_t"],
+                )
     except UnknownGroup as exc:
         raise HTTPException(
             status_code=422,
@@ -444,8 +490,7 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
         payload.forecast_from_date,
         payload.forecast_to_date,
     )
-    instances = []
-    references = []
+    forecast_rows: dict[date, list[tuple[str, dict, dict, int]]] = defaultdict(list)
     for row, year, _, _ in targets:
         entity_id = twin_id(config["entity_type"], row["id_civico"], year)
         label = int(labels[entity_id]["cluster_label"])
@@ -454,25 +499,54 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
                 continue
             if (event["frazione"], label) not in request.app.state.model_package.sessions:
                 continue
-            instances.append(PredictionInput(
-                data=event["data"],
-                anno_produzione=row["anno_produzione"],
-                coord_x=row["coord_x"],
-                coord_y=row["coord_y"],
-                densita_locale=row["densita_locale"],
-                giorni_accumulati=event["giorni_accumulati"],
-                zona_raccolta=int(row["zona_raccolta"]),
-                frazione=event["frazione"],
-                cluster_label=label,
-            ))
-            references.append((entity_id, event["data"], event["frazione"]))
+            forecast_rows[event["data"]].append((entity_id, row, event, label))
+    lag_state = LagState()
+    target_civics = {str(row["id_civico"]) for row, _, _, _ in targets}
+    for history_row in sorted(rows, key=lambda item: parse_datetime(item["timestamp"])):
+        if str(history_row["id_civico"]) in target_civics:
+            lag_state.add(
+                history_row["id_civico"],
+                history_row["frazione"],
+                history_row["timestamp"],
+                history_row["conferimento_t"],
+            )
+    grouped: dict[str, dict[date, dict[str, float]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
     try:
-        values = request.app.state.model_package.predict(instances)
+        for event_date, descriptors in sorted(forecast_rows.items()):
+            instances = []
+            for _, row, event, label in descriptors:
+                lag_values = lag_state.features(
+                    row["id_civico"], event["frazione"], event_date
+                )
+                instances.append(PredictionInput(
+                    data=event_date,
+                    anno_produzione=row["anno_produzione"],
+                    coord_x=row["coord_x"],
+                    coord_y=row["coord_y"],
+                    densita_locale=row["densita_locale"],
+                    giorni_accumulati=event["giorni_accumulati"],
+                    historical_annual_t=row[f"{event['frazione']}_t"],
+                    historical_collection_mean_t=(
+                        row[f"{event['frazione']}_t"]
+                        / event["annual_collection_count"]
+                    ),
+                    zona_raccolta=int(row["zona_raccolta"]),
+                    frazione=event["frazione"],
+                    cluster_label=label,
+                    **lag_values,
+                ))
+            values = request.app.state.model_package.predict(instances)
+            for (entity_id, row, event, _), value in zip(
+                descriptors, values, strict=True
+            ):
+                lag_state.add(
+                    row["id_civico"], event["frazione"], event_date, value
+                )
+                grouped[entity_id][event_date][event["frazione"]] = value
     except UnknownGroup as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    grouped: dict[str, dict[date, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
-    for (entity_id, event_date, fraction), value in zip(references, values, strict=True):
-        grouped[entity_id][event_date][fraction] = value
 
     observed = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     entities = []

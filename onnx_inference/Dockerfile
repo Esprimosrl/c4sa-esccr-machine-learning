@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 app
 COPY onnx_inference/app.py .
 COPY quantumleap.py .
-COPY inference_data.py orion.py .
+COPY inference_data.py orion.py lag_features.py .
 COPY data_csv_parquet/calendario_raccolta.csv .
 
 USER app

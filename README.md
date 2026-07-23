@@ -4,8 +4,8 @@ Questo progetto addestra e distribuisce due modelli:
 
 - un classificatore K-means, che assegna ogni civico a un cluster usando i dati
   annuali;
-- un regressore SGD raggruppato per frazione e cluster, che stima le tonnellate
-  dei conferimenti futuri.
+- un regressore selezionabile, raggruppato per frazione e cluster, che stima le
+  tonnellate dei conferimenti futuri.
 
 I dati possono provenire da file locali oppure da QuantumLeap. I risultati
 possono essere pubblicati in Orion come entità `RifiutiDigitalTwin` e quindi
@@ -142,8 +142,19 @@ La sorgente predefinita è il file locale. Il flusso eseguito è:
 
 ```text
 CSV annuale → K-means → distribuzione giornaliera sintetica
-             → regressore SGD raggruppato
+             → regressore raggruppato SGD, GPR, histogram gradient boosting o ARIMA
 ```
+
+La distribuzione giornaliera aggiunge anche `historical_annual_t` e
+`historical_collection_mean_t`. Per le previsioni future rappresentano
+rispettivamente l'ultima quantità annua osservata per civico/frazione e la sua
+media per raccolta pianificata.
+
+Il regressore calcola inoltre, senza pubblicarli, i lag per civico/frazione:
+ultimo conferimento, somme dei 7 e 30 giorni precedenti, mediana e conteggio
+dei 90 giorni precedenti e giorni dall'ultimo conferimento positivo. Validation,
+test e forecast aggiornano questi lag ricorsivamente con le previsioni, senza
+leggere target futuri.
 
 Il runner salta gli step i cui output sono già più recenti degli input. Per
 rieseguirli:
@@ -162,6 +173,84 @@ generati già in uso, indicare una directory isolata:
   --output-dir artifacts/prova-2024
 ```
 
+SGD resta il regressore predefinito. Per addestrare invece i 72
+`GaussianProcessRegressor` raggruppati per frazione e cluster:
+
+```bash
+./run_pipeline.sh --regressor gpr \
+  --gpr-max-train-rows 500 \
+  --output-dir artifacts/gpr-2024 \
+  --force
+```
+
+GPR esatto non scala a milioni di righe per gruppo. La pipeline divide quindi
+cronologicamente il train set di ogni gruppo in un massimo di 500 intervalli e
+sceglie una riga deterministica per intervallo. Il limite è configurabile; le
+metriche e le previsioni continuano a essere calcolate sugli split completi.
+
+Per addestrare un `HistGradientBoostingRegressor` su tutte le righe di ogni
+gruppo, con loss Poisson e valutazione cronologica ricorsiva:
+
+```bash
+./run_pipeline.sh \
+  --source file \
+  --anno 2024 \
+  --regressor hist_gradient_boosting \
+  --output-dir artifacts/hist-gradient-boosting-2024 \
+  --force
+```
+
+I 72 gruppi vengono elaborati in sequenza, quindi in memoria viene caricato un
+solo gruppo alla volta. A differenza di GPR, questo modello non applica un limite
+al numero di righe di training.
+
+Per addestrare invece 72 serie giornaliere SARIMA, una per coppia
+`frazione`/`cluster_label`, e produrre previsioni future per civico:
+
+```bash
+./run_pipeline.sh \
+  --regressor arima \
+  --arima-group-level \
+  --forecast-from-date 2025-01-07 \
+  --forecast-to-date 2025-12-31 \
+  --output-dir artifacts/arima-2024 \
+  --force
+```
+
+La pipeline somma i conferimenti di ogni gruppo su un calendario giornaliero,
+riempie con zero i giorni mancanti e confronta modelli con stagionalità
+settimanale su tre finestre di validation espandibili. Per ogni gruppo seleziona
+il SARIMA con RMSE medio più basso e riporta anche il benchmark stagionale
+naive `y[t-7]`; il test finale resta separato dalla selezione. Con
+`--arima-group-level` il processo si ferma qui e
+scrive una riga per data, frazione e cluster, senza richiedere un calendario di
+raccolta. Senza il flag, ogni totale viene invece ripartito tra i civici in
+raccolta quel giorno in proporzione alla quantità annua storica della frazione;
+in questo caso `--forecast-calendar` è obbligatorio per le previsioni future.
+Se un SARIMA diventa numericamente non finito su un lungo orizzonte futuro,
+quel gruppo usa il benchmark settimanale e lo segnala in `forecast_method`.
+ARIMA è disponibile soltanto come output batch: non viene esportato in ONNX né
+pubblicato in Orion.
+
+Per prevedere invece i conferimenti secondo la loro unità operativa naturale,
+si possono addestrare 48 serie `frazione`/`zona_raccolta` usando il calendario
+originale del gestore:
+
+```bash
+./run_pipeline.sh \
+  --regressor arima \
+  --arima-group-level \
+  --arima-group-by zone \
+  --calendar-input data_csv_parquet/calendario_raccolta.csv \
+  --forecast-from-date 2025-01-07 \
+  --forecast-to-date 2025-12-31 \
+  --output-dir artifacts/arima-zone-2024 \
+  --force
+```
+
+Questa modalità mantiene separati modello, metriche e previsioni tramite nomi
+di artifact con suffisso `zone_level` o `by_zone`.
+
 `--output-dir` mantiene al suo interno la stessa struttura standard:
 
 ```text
@@ -169,7 +258,7 @@ artifacts/prova-2024/
 ├── data_csv_parquet/     # output derivati della modalità file
 ├── models/               # classificatore e regressore
 ├── predictions/          # previsioni del test set
-└── grouped_sgd_time_series_metrics.csv
+└── grouped_<regressor>_time_series_metrics.csv
 ```
 
 Gli input sorgente non vengono copiati o modificati. Gli snapshot QuantumLeap
@@ -256,11 +345,24 @@ curl -X POST http://localhost:8002/v1/training-jobs \
     "source": "file",
     "year": 2024,
     "seed": 42,
+    "regressor": "gpr",
+    "gpr_max_train_rows": 500,
     "annual_input_path": "/data/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
     "calendar_input_path": "/data/calendario_raccolta.csv",
     "output_dir": "/artifacts/file-2024",
     "force": false
   }'
+```
+
+Per un job ARIMA aggregato, impostare `"regressor": "arima"`, aggiungere
+`"arima_group_level": true` e il blocco opzionale `forecast`; senza questo
+blocco viene omesso soltanto il file futuro:
+
+```json
+"forecast": {
+  "forecast_from_date": "2025-01-07",
+  "forecast_to_date": "2025-12-31"
+}
 ```
 
 Oppure leggere lo storico da QuantumLeap e, facoltativamente, pubblicare i
@@ -317,7 +419,7 @@ fetch storico
 → aggregazione delle 13 frazioni per civico/anno
 → addestramento K-means
 → classificazione di ogni riga giornaliera
-→ addestramento regressore per frazione/cluster
+→ addestramento del regressore selezionato per frazione/cluster
 ```
 
 Le frazioni note assenti vengono valorizzate a zero. Gli snapshot Parquet sono
@@ -350,6 +452,20 @@ Output persistenti principali:
 | `models/grouped_sgd_time_series.joblib` | Regressori raggruppati |
 | `grouped_sgd_time_series_metrics.csv` | Metriche train/validation/test |
 | `predictions/sgd_test_predictions_grouped.parquet` | Previsioni sul test set |
+| `models/grouped_gpr_time_series.joblib` | Regressori GPR raggruppati, se selezionati |
+| `grouped_gpr_time_series_metrics.csv` | Metriche GPR train/validation/test |
+| `predictions/gpr_test_predictions_grouped.parquet` | Previsioni GPR sul test set |
+| `models/grouped_hist_gradient_boosting_time_series.joblib` | Regressori histogram gradient boosting raggruppati |
+| `grouped_hist_gradient_boosting_time_series_metrics.csv` | Metriche histogram gradient boosting |
+| `predictions/hist_gradient_boosting_test_predictions_grouped.parquet` | Previsioni histogram gradient boosting |
+| `models/grouped_arima_time_series.joblib` | 72 modelli SARIMA giornalieri raggruppati |
+| `grouped_arima_time_series_metrics.csv` | Metriche aggregate e per-civico ARIMA |
+| `predictions/arima_test_predictions_per_civic.parquet` | Previsioni ARIMA per-civico sul test set |
+| `predictions/arima_future_predictions_per_civic.parquet` | Previsioni future per-civico, se richieste |
+| `models/grouped_arima_time_series_group_level.joblib` | Modelli SARIMA salvati dalla modalità aggregata |
+| `grouped_arima_time_series_group_level_metrics.csv` | Metriche aggregate della modalità group-level |
+| `predictions/arima_test_predictions_grouped.parquet` | Totali ARIMA per data/frazione/cluster sul test set |
+| `predictions/arima_future_predictions_grouped.parquet` | Totali ARIMA futuri, con `--arima-group-level` |
 
 Per vedere il grafo senza eseguirlo:
 
@@ -414,6 +530,10 @@ bin/python onnx_inference/export_models.py \
   --input models/grouped_sgd_time_series.joblib \
   --output-dir .tmp/grouped-sgd-onnx
 ```
+
+L'esportatore accetta anche i bundle GPR e histogram gradient boosting; il
+servizio di inferenza e la pubblicazione dei twin espongono in ogni caso la sola
+previsione media.
 
 Ogni directory contiene `manifest.json` e i modelli ONNX. Gli esportatori non
 sovrascrivono directory esistenti: usare una nuova directory per ogni versione.

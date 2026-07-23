@@ -41,6 +41,137 @@ def local_path(path: Path | None, default: str) -> Path:
     return resolved if resolved.is_absolute() else rel(str(resolved))
 
 
+def regression_artifacts(
+    output_dir: Path | None,
+    regressor: str,
+    arima_group_level: bool = False,
+    arima_group_by: str = "cluster",
+) -> tuple[Path, Path, Path]:
+    stem = (
+        (
+            "grouped_arima_time_series_zone_level"
+            if arima_group_by == "zone"
+            else "grouped_arima_time_series_group_level"
+        )
+        if regressor == "arima" and arima_group_level
+        else f"grouped_{regressor}_time_series"
+    )
+    return (
+        artifact(output_dir, f"models/{stem}.joblib"),
+        artifact(output_dir, f"{stem}_metrics.csv"),
+        artifact(
+            output_dir,
+            (
+                (
+                    (
+                        "predictions/arima_test_predictions_by_zone.parquet"
+                        if arima_group_by == "zone"
+                        else "predictions/arima_test_predictions_grouped.parquet"
+                    )
+                    if arima_group_level
+                    else "predictions/arima_test_predictions_per_civic.parquet"
+                )
+                if regressor == "arima"
+                else f"predictions/{regressor}_test_predictions_grouped.parquet"
+            ),
+        ),
+    )
+
+
+def arima_future_artifact(
+    output_dir: Path | None,
+    group_level: bool = False,
+    group_by: str = "cluster",
+) -> Path:
+    return artifact(
+        output_dir,
+        (
+            (
+                "predictions/arima_future_predictions_by_zone.parquet"
+                if group_by == "zone"
+                else "predictions/arima_future_predictions_grouped.parquet"
+            )
+            if group_level
+            else "predictions/arima_future_predictions_per_civic.parquet"
+        ),
+    )
+
+
+def regression_command(
+    python: str,
+    regressor: str,
+    gpr_max_train_rows: int,
+    classified: Path,
+    predictions: Path,
+    model: Path,
+    metrics: Path,
+    seed: str,
+    forecast_from_date: str | None = None,
+    forecast_to_date: str | None = None,
+    forecast_calendar: Path | None = None,
+    future_predictions: Path | None = None,
+    arima_group_level: bool = False,
+    arima_group_by: str = "cluster",
+) -> list[str]:
+    if regressor == "arima":
+        command = [
+            python,
+            "model-training/regression/train_grouped_arima_time_series.py",
+            "--input",
+            str(classified),
+            "--split-ratios",
+            "80,10,10",
+            "--predictions-output",
+            str(predictions),
+            "--model-output",
+            str(model),
+            "--metrics-output",
+            str(metrics),
+        ]
+        if arima_group_level:
+            command.append("--group-level")
+        if arima_group_by == "zone":
+            command += ["--group-by", "zone"]
+        if forecast_from_date:
+            command += [
+                "--forecast-from-date",
+                forecast_from_date,
+                "--forecast-to-date",
+                forecast_to_date,
+                "--future-predictions-output",
+                str(future_predictions),
+            ]
+            if not arima_group_level:
+                command += ["--forecast-calendar", str(forecast_calendar)]
+        return command
+
+    return [
+        python,
+        "model-training/regression/train_grouped_sgd_time_series_regressor.py",
+        "--regressor",
+        regressor,
+        "--gpr-max-train-rows",
+        str(gpr_max_train_rows),
+        "--input",
+        str(classified),
+        "--split-ratios",
+        "80,10,10",
+        "--epochs",
+        "3",
+        "--batch-size",
+        "4096",
+        "--predictions-output",
+        str(predictions),
+        "--model-output",
+        str(model),
+        "--metrics-output",
+        str(metrics),
+        "--seed",
+        seed,
+        "--progress",
+    ]
+
+
 def normalize_training_range(from_date: str, to_date: str) -> tuple[str, str]:
     def normalize(value: str, end: bool) -> str:
         try:
@@ -71,6 +202,13 @@ def build_graph(
     output_dir: Path | None = None,
     annual_input: Path | None = None,
     calendar_input: Path | None = None,
+    regressor: str = "sgd",
+    gpr_max_train_rows: int = 500,
+    forecast_from_date: str | None = None,
+    forecast_to_date: str | None = None,
+    forecast_calendar: Path | None = None,
+    arima_group_level: bool = False,
+    arima_group_by: str = "cluster",
 ) -> dict[str, Node]:
     annual_input = local_path(
         annual_input,
@@ -91,12 +229,22 @@ def build_graph(
     classifier_model = artifact(
         output_dir, "models/kmeans_model_annuo_peso_coord.joblib"
     )
-    regressor_model = artifact(
-        output_dir, "models/grouped_sgd_time_series.joblib"
+    regressor_model, metrics, predictions = regression_artifacts(
+        output_dir, regressor, arima_group_level, arima_group_by
     )
-    metrics = artifact(output_dir, "grouped_sgd_time_series_metrics.csv")
-    predictions = artifact(
-        output_dir, "predictions/sgd_test_predictions_grouped.parquet"
+    regression_node = f"grouped_{regressor}"
+    future_predictions = (
+        arima_future_artifact(output_dir, arima_group_level, arima_group_by)
+        if regressor == "arima" and forecast_from_date
+        else None
+    )
+    selected_forecast_calendar = (
+        local_path(forecast_calendar, str(calendar_input))
+        if future_predictions and not arima_group_level
+        else None
+    )
+    regression_outputs = (regressor_model, metrics, predictions) + (
+        (future_predictions,) if future_predictions else ()
     )
     graph = {
         "kmeans": Node(
@@ -162,31 +310,28 @@ def build_graph(
             outputs=(classified, production),
             needs=("kmeans",),
         ),
-        "grouped_sgd": Node(
-            name="grouped_sgd",
-            command=[
+        regression_node: Node(
+            name=regression_node,
+            command=regression_command(
                 python,
-                "model-training/regression/train_grouped_sgd_time_series_regressor.py",
-                "--input",
-                str(classified),
-                "--split-ratios",
-                "80,10,10",
-                "--epochs",
-                "3",
-                "--batch-size",
-                "4096",
-                "--predictions-output",
-                str(predictions),
-                "--model-output",
-                str(regressor_model),
-                "--metrics-output",
-                str(metrics),
-                "--seed",
+                regressor,
+                gpr_max_train_rows,
+                classified,
+                predictions,
+                regressor_model,
+                metrics,
                 seed,
-                "--progress",
-            ],
-            inputs=(classified,),
-            outputs=(regressor_model, metrics, predictions),
+                forecast_from_date,
+                forecast_to_date,
+                selected_forecast_calendar,
+                future_predictions,
+                arima_group_level,
+                arima_group_by,
+            ),
+            inputs=(classified,) + (
+                (selected_forecast_calendar,) if selected_forecast_calendar else ()
+            ),
+            outputs=regression_outputs,
             needs=("daily_distribution",),
         ),
     }
@@ -204,15 +349,31 @@ def build_quantumleap_graph(
     assignments = temp_dir / "quantumleap_assignments.parquet"
     classified = temp_dir / "quantumleap_classified.parquet"
     output_dir = getattr(args, "output_dir", None)
+    regressor = getattr(args, "regressor", "sgd")
+    gpr_max_train_rows = getattr(args, "gpr_max_train_rows", 500)
+    arima_group_level = getattr(args, "arima_group_level", False)
+    arima_group_by = getattr(args, "arima_group_by", "cluster")
     classifier_model = artifact(
         output_dir, "models/kmeans_model_annuo_peso_coord.joblib"
     )
-    regressor_model = artifact(
-        output_dir, "models/grouped_sgd_time_series.joblib"
+    regressor_model, metrics, predictions = regression_artifacts(
+        output_dir, regressor, arima_group_level, arima_group_by
     )
-    metrics = artifact(output_dir, "grouped_sgd_time_series_metrics.csv")
-    predictions = artifact(
-        output_dir, "predictions/sgd_test_predictions_grouped.parquet"
+    regression_node = f"grouped_{regressor}"
+    forecast_from_date = getattr(args, "forecast_from_date", None)
+    forecast_to_date = getattr(args, "forecast_to_date", None)
+    forecast_calendar = getattr(args, "forecast_calendar", None)
+    if forecast_calendar:
+        forecast_calendar = Path(forecast_calendar)
+        if not forecast_calendar.is_absolute():
+            forecast_calendar = rel(str(forecast_calendar))
+    future_predictions = (
+        arima_future_artifact(output_dir, arima_group_level, arima_group_by)
+        if regressor == "arima" and forecast_from_date
+        else None
+    )
+    regression_outputs = (regressor_model, metrics, predictions) + (
+        (future_predictions,) if future_predictions else ()
     )
     fetch_command = [
         python,
@@ -304,35 +465,30 @@ def build_quantumleap_graph(
             (classified,),
             ("kmeans",),
         ),
-        "grouped_sgd": Node(
-            "grouped_sgd",
-            [
+        regression_node: Node(
+            regression_node,
+            regression_command(
                 python,
-                "model-training/regression/train_grouped_sgd_time_series_regressor.py",
-                "--input",
-                str(classified),
-                "--split-ratios",
-                "80,10,10",
-                "--epochs",
-                "3",
-                "--batch-size",
-                "4096",
-                "--predictions-output",
-                str(predictions),
-                "--model-output",
-                str(regressor_model),
-                "--metrics-output",
-                str(metrics),
-                "--seed",
-                seed,
-                "--progress",
-            ],
-            (classified,),
-            (
+                regressor,
+                gpr_max_train_rows,
+                classified,
+                predictions,
                 regressor_model,
                 metrics,
-                predictions,
+                seed,
+                forecast_from_date,
+                forecast_to_date,
+                forecast_calendar,
+                future_predictions,
+                arima_group_level,
+                arima_group_by,
             ),
+            (classified,) + (
+                (forecast_calendar,)
+                if future_predictions and not arima_group_level
+                else ()
+            ),
+            regression_outputs,
             ("cluster_join",),
         ),
     }
@@ -352,6 +508,8 @@ def build_quantumleap_graph(
                 str(classifier_model),
                 "--regressor-model",
                 str(regressor_model),
+                "--history",
+                str(classified),
                 "--calendar",
                 str(calendar),
                 "--forecast-from-date",
@@ -379,10 +537,11 @@ def build_quantumleap_graph(
                 assignments,
                 classifier_model,
                 regressor_model,
+                classified,
                 calendar,
             ),
             (),
-            ("grouped_sgd",),
+            (regression_node,),
         )
     return graph
 
@@ -511,7 +670,22 @@ def main() -> None:
     parser.add_argument("--python", default=os.environ.get("PYTHON", sys.executable))
     parser.add_argument("--seed", default=os.environ.get("SEED", "42"))
     parser.add_argument("--anno", default=os.environ.get("ANNO", "2024"))
+    parser.add_argument(
+        "--regressor",
+        choices=["sgd", "gpr", "hist_gradient_boosting", "arima"],
+        default="sgd",
+    )
+    parser.add_argument("--gpr-max-train-rows", type=int, default=500)
+    parser.add_argument("--arima-group-level", action="store_true")
+    parser.add_argument(
+        "--arima-group-by", choices=["cluster", "zone"], default="cluster"
+    )
     parser.add_argument("--source", choices=["file", "quantumleap"], default="file")
+    parser.add_argument(
+        "--calendar-input",
+        type=Path,
+        default=Path("data_csv_parquet/calendario_raccolta.csv"),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -577,6 +751,31 @@ def main() -> None:
         self_check()
         return
 
+    if args.gpr_max_train_rows <= 0:
+        parser.error("--gpr-max-train-rows must be greater than zero")
+
+    if bool(args.forecast_from_date) != bool(args.forecast_to_date):
+        parser.error(
+            "--forecast-from-date and --forecast-to-date must be supplied together"
+        )
+    if args.regressor == "arima" and args.publish_orion:
+        parser.error("ARIMA supports batch files, not --publish-orion")
+    if args.arima_group_level and args.regressor != "arima":
+        parser.error("--arima-group-level requires --regressor arima")
+    if args.arima_group_by == "zone" and not (
+        args.regressor == "arima" and args.arima_group_level
+    ):
+        parser.error(
+            "--arima-group-by zone requires --regressor arima "
+            "and --arima-group-level"
+        )
+    if (
+        args.forecast_from_date
+        and args.regressor != "arima"
+        and not args.publish_orion
+    ):
+        parser.error("forecast dates without --publish-orion require --regressor arima")
+
     if args.source == "quantumleap":
         if not args.from_date or not args.to_date:
             parser.error(
@@ -615,7 +814,20 @@ def main() -> None:
             parser.error("Orion timeout and batch size must be greater than zero")
 
     if args.source == "file":
-        graph = build_graph(args.python, args.seed, args.anno, args.output_dir)
+        graph = build_graph(
+            args.python,
+            args.seed,
+            args.anno,
+            args.output_dir,
+            calendar_input=args.calendar_input,
+            regressor=args.regressor,
+            gpr_max_train_rows=args.gpr_max_train_rows,
+            forecast_from_date=args.forecast_from_date,
+            forecast_to_date=args.forecast_to_date,
+            forecast_calendar=Path(args.forecast_calendar),
+            arima_group_level=args.arima_group_level,
+            arima_group_by=args.arima_group_by,
+        )
         if args.print_graph:
             print_mermaid(graph)
             return

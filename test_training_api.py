@@ -58,6 +58,7 @@ def test_file_job_uses_requested_paths_seed_and_force(tmp_path, monkeypatch):
             "source": "file",
             "year": 2024,
             "seed": 123,
+            "regressor": "hist_gradient_boosting",
             "annual_input_path": str(annual),
             "calendar_input_path": str(calendar),
             "output_dir": str(tmp_path / "outputs"),
@@ -77,7 +78,7 @@ def test_file_job_uses_requested_paths_seed_and_force(tmp_path, monkeypatch):
     assert calendar.resolve() in graph["daily_distribution"].inputs
     assert captured["force"] is True
     assert captured["dry_run"] is False
-    for name in ("kmeans", "daily_distribution", "grouped_sgd"):
+    for name in ("kmeans", "daily_distribution", "grouped_hist_gradient_boosting"):
         command = graph[name].command
         assert command[command.index("--seed") + 1] == "123"
 
@@ -99,6 +100,8 @@ def test_quantumleap_job_can_publish_to_orion(tmp_path, monkeypatch):
         {
             "source": "quantumleap",
             "seed": 7,
+            "regressor": "gpr",
+            "gpr_max_train_rows": 321,
             "from_date": "2024-01-01",
             "to_date": "2024-12-31",
             "ql_id_pattern": ".*:vetro",
@@ -118,7 +121,7 @@ def test_quantumleap_job_can_publish_to_orion(tmp_path, monkeypatch):
         "annual_aggregation",
         "kmeans",
         "cluster_join",
-        "grouped_sgd",
+        "grouped_gpr",
         "publish_digital_twins",
     ]
     fetch = graph["quantumleap_fetch"].command
@@ -129,9 +132,86 @@ def test_quantumleap_job_can_publish_to_orion(tmp_path, monkeypatch):
     publish = graph["publish_digital_twins"].command
     assert "http://orion:1026" in publish
     assert str(calendar.resolve()) in publish
-    for name in ("kmeans", "grouped_sgd"):
+    gpr_command = graph["grouped_gpr"].command
+    assert gpr_command[gpr_command.index("--regressor") + 1] == "gpr"
+    assert gpr_command[gpr_command.index("--gpr-max-train-rows") + 1] == "321"
+    assert graph["publish_digital_twins"].needs == ("grouped_gpr",)
+    assert any("grouped_gpr_time_series.joblib" in value for value in publish)
+    for name in ("kmeans", "grouped_gpr"):
         command = graph[name].command
         assert command[command.index("--seed") + 1] == "7"
+
+
+def test_arima_job_routes_future_batch_outputs(tmp_path, monkeypatch):
+    annual, calendar = local_files(tmp_path)
+    captured = {}
+
+    def run_graph(graph, force, dry_run):
+        captured["graph"] = graph
+
+    monkeypatch.setattr(training_api.pipeline, "run_graph", run_graph)
+    job = submit(
+        {
+            "source": "file",
+            "year": 2024,
+            "regressor": "arima",
+            "annual_input_path": str(annual),
+            "calendar_input_path": str(calendar),
+            "output_dir": str(tmp_path / "outputs"),
+            "forecast": {
+                "forecast_from_date": "2025-01-07",
+                "forecast_to_date": "2025-01-31",
+                "forecast_calendar_path": str(calendar),
+            },
+        }
+    )
+
+    assert training_api.get_training_job(job.job_id).status == "succeeded"
+    node = captured["graph"]["grouped_arima"]
+    assert "train_grouped_arima_time_series.py" in node.command[1]
+    assert "--regressor" not in node.command
+    assert str(calendar.resolve()) in node.command
+    assert any("arima_test_predictions_per_civic.parquet" in str(p) for p in node.outputs)
+    assert any("arima_future_predictions_per_civic.parquet" in str(p) for p in node.outputs)
+
+    grouped_job = submit(
+        {
+            "source": "file",
+            "year": 2024,
+            "regressor": "arima",
+            "arima_group_level": True,
+            "annual_input_path": str(annual),
+            "calendar_input_path": str(calendar),
+            "output_dir": str(tmp_path / "grouped-outputs"),
+            "forecast": {
+                "forecast_from_date": "2025-01-07",
+                "forecast_to_date": "2025-01-31",
+            },
+        }
+    )
+    assert training_api.get_training_job(grouped_job.job_id).status == "succeeded"
+    grouped_node = captured["graph"]["grouped_arima"]
+    assert "--group-level" in grouped_node.command
+    assert "--forecast-calendar" not in grouped_node.command
+    assert any("grouped_arima_time_series_group_level.joblib" in str(p) for p in grouped_node.outputs)
+    assert any("arima_test_predictions_grouped.parquet" in str(p) for p in grouped_node.outputs)
+    assert any("arima_future_predictions_grouped.parquet" in str(p) for p in grouped_node.outputs)
+
+    with pytest.raises(ValidationError, match="not Orion"):
+        request_adapter.validate_python(
+            {
+                "source": "quantumleap",
+                "regressor": "arima",
+                "from_date": "2024-01-01",
+                "to_date": "2024-12-31",
+                "output_dir": str(tmp_path / "outputs"),
+                "orion": {
+                    "forecast_from_date": "2025-01-01",
+                    "forecast_to_date": "2025-01-31",
+                    "forecast_calendar_path": str(calendar),
+                },
+            }
+        )
 
 
 def test_failed_job_and_request_errors_are_reported(tmp_path, monkeypatch):

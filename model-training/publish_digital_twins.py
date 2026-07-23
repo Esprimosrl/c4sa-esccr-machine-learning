@@ -16,6 +16,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from lag_features import LAG_FEATURES, LagState
+
 ROOT = Path(__file__).resolve().parents[1]
 REGRESSION_DIR = ROOT / "model-training" / "regression"
 for path in (ROOT, REGRESSION_DIR):
@@ -28,7 +30,7 @@ from dataset.distribuzione_giornaliera import (
     read_calendar_events,
 )
 from train_grouped_sgd_time_series_regressor import (
-    get_feature_columns,
+    clip_raw_predictions,
     make_features,
     prediction_log_to_raw,
 )
@@ -93,7 +95,10 @@ def latest_assignments(assignments: pd.DataFrame, forecast_year: int) -> pd.Data
             f"Assignments missing columns: {', '.join(sorted(missing))}."
         )
 
-    eligible = assignments[sorted(required)].copy()
+    history_columns = {
+        column for column in assignments.columns if column.endswith("_t")
+    }
+    eligible = assignments[sorted(required | history_columns)].copy()
     eligible[year_col] = pd.to_numeric(eligible[year_col], errors="raise")
     eligible = eligible[eligible[year_col] <= forecast_year]
     if eligible.empty:
@@ -150,6 +155,9 @@ def collection_features(
                 event_date = date.fromisoformat(event_date)
             key = (normalize_zone(item["zona_raccolta"]), event_date)
             counts[key] = counts.get(key, 0) + 1
+        collection_counts: dict[str, int] = {}
+        for zone, _ in counts:
+            collection_counts[zone] = collection_counts.get(zone, 0) + 1
         for (zone, event_date), accumulated in counts.items():
             if start <= event_date <= end and event_date.year == year:
                 rows.append(
@@ -158,11 +166,18 @@ def collection_features(
                         "frazione": fraction.label,
                         "data": event_date,
                         "giorni_accumulati": accumulated,
+                        "annual_collection_count": collection_counts[zone],
                     }
                 )
     return pd.DataFrame(
         rows,
-        columns=["zona_raccolta", "frazione", "data", "giorni_accumulati"],
+        columns=[
+            "zona_raccolta",
+            "frazione",
+            "data",
+            "giorni_accumulati",
+            "annual_collection_count",
+        ],
     ).sort_values(["data", "zona_raccolta", "frazione"])
 
 
@@ -180,6 +195,54 @@ def add_date_features(frame: pd.DataFrame, year: int) -> pd.DataFrame:
     result["season_sin"] = np.sin(2 * math.pi * day_of_year / 366.0)
     result["season_cos"] = np.cos(2 * math.pi * day_of_year / 366.0)
     return result
+
+
+def load_lag_state(history_path: Path, before: date) -> LagState:
+    reader = "read_parquet(?)" if history_path.suffix != ".csv" else "read_csv_auto(?)"
+    con = duckdb.connect()
+    cursor = con.execute(f"""
+        WITH typed AS (
+            SELECT
+                CAST(id_civico AS VARCHAR) AS id_civico,
+                CAST(frazione AS VARCHAR) AS frazione,
+                CAST(data AS DATE) AS data_dt,
+                TRY_CAST(conferimento_t AS DOUBLE) AS target_value
+            FROM {reader}
+        ),
+        past AS (
+            SELECT *
+            FROM typed
+            WHERE data_dt < CAST(? AS DATE)
+              AND target_value IS NOT NULL
+        ),
+        selected AS (
+            SELECT *
+            FROM past
+            WHERE data_dt >= CAST(? AS DATE) - INTERVAL 90 DAY
+            UNION
+            SELECT *
+            FROM past
+            QUALIFY row_number() OVER (
+                PARTITION BY id_civico, frazione ORDER BY data_dt DESC
+            ) = 1
+            UNION
+            SELECT *
+            FROM past
+            WHERE target_value > 0
+            QUALIFY row_number() OVER (
+                PARTITION BY id_civico, frazione ORDER BY data_dt DESC
+            ) = 1
+        )
+        SELECT id_civico, frazione, data_dt, target_value
+        FROM selected
+        ORDER BY id_civico, frazione, data_dt;
+    """, [str(history_path), before, before])
+    state = LagState()
+    while rows := cursor.fetchmany(100_000):
+        for civic, fraction, event_date, value in rows:
+            state.add(civic, fraction, event_date, value)
+    con.close()
+    return state
 
 
 def typed_attribute(value: object, ngsi_type: str) -> dict[str, object]:
@@ -245,6 +308,7 @@ def stage_twins(
     forecast_end: date,
     entity_type: str,
     output_path: Path,
+    history_path: Path | None = None,
 ) -> int:
     if not entity_type.strip():
         raise ValueError("Orion entity type must not be empty.")
@@ -252,13 +316,18 @@ def stage_twins(
         "SELECT * FROM read_parquet(?)", [str(assignments_path)]
     ).df()
     bundle = joblib.load(regressor_path)
-    if bundle.get("model_name") != "grouped_sgd":
-        raise ValueError("Regressor bundle is not a grouped_sgd model.")
-    numeric_cols, categorical_cols, _ = get_feature_columns(False)
-    if bundle.get("numeric_cols") != numeric_cols:
-        raise ValueError("Regressor numeric features do not match the trainer.")
-    if bundle.get("categorical_cols") != categorical_cols:
-        raise ValueError("Regressor categorical features do not match the trainer.")
+    if bundle.get("model_name") not in {
+        "grouped_sgd",
+        "grouped_gpr",
+        "grouped_hist_gradient_boosting",
+    }:
+        raise ValueError("Unsupported grouped regressor bundle.")
+    numeric_cols = bundle["numeric_cols"]
+    categorical_cols = bundle["categorical_cols"]
+    uses_lags = any(name in numeric_cols for name in LAG_FEATURES)
+    if uses_lags and history_path is None:
+        raise ValueError("Regressor lag features require a history dataset.")
+    lag_state = load_lag_state(history_path, forecast_start) if uses_lags else None
     known_fractions = {item.label for item in FRACTIONS}
     bundle_fractions = {
         key.split("|", 1)[0].removeprefix("frazione=")
@@ -314,26 +383,61 @@ def stage_twins(
                         )
                         if merged.empty:
                             continue
+                        annual_col = f"{fraction}_t"
+                        if "historical_annual_t" in numeric_cols:
+                            if annual_col not in merged:
+                                raise ValueError(
+                                    f"Assignments missing historical quantity: {annual_col}."
+                                )
+                            merged["historical_annual_t"] = pd.to_numeric(
+                                merged[annual_col], errors="raise"
+                            )
+                        if "historical_collection_mean_t" in numeric_cols:
+                            merged["historical_collection_mean_t"] = (
+                                pd.to_numeric(merged[annual_col], errors="raise")
+                                / merged["annual_collection_count"]
+                            )
                         merged = add_date_features(merged, year)
                         info = bundle["models"][model_key]
-                        features = make_features(
-                            merged,
-                            numeric_cols,
-                            categorical_cols,
-                            info["numeric_stats"],
+                        prediction_upper_bound = info.get(
+                            "prediction_upper_bound_t"
                         )
-                        predictions = prediction_log_to_raw(
-                            info["model"].predict(features)
-                        )
-                        for civic, event_date, prediction in zip(
-                            merged["id_civico"],
-                            merged["data"],
-                            predictions,
-                            strict=True,
-                        ):
-                            values[str(civic)].setdefault(event_date, {})[
-                                fraction
-                            ] = float(prediction)
+                        for event_date, positions in merged.groupby(
+                            "data", sort=True
+                        ).indices.items():
+                            batch = merged.iloc[positions].copy()
+                            if lag_state is not None:
+                                lag_rows = [
+                                    lag_state.features(civic, fraction, event_date)
+                                    for civic in batch["id_civico"]
+                                ]
+                                for name in LAG_FEATURES:
+                                    batch[name] = [row[name] for row in lag_rows]
+                            features = make_features(
+                                batch,
+                                numeric_cols,
+                                categorical_cols,
+                                info["numeric_stats"],
+                            )
+                            predictions = info["model"].predict(features)
+                            if bundle.get("target_transform", "log1p") == "log1p":
+                                predictions = prediction_log_to_raw(
+                                    predictions, prediction_upper_bound
+                                )
+                            else:
+                                predictions = clip_raw_predictions(
+                                    predictions, prediction_upper_bound
+                                )
+                            for civic, prediction in zip(
+                                batch["id_civico"], predictions, strict=True
+                            ):
+                                if lag_state is not None:
+                                    lag_state.add(
+                                        civic, fraction, event_date, float(prediction)
+                                    )
+                                values[str(civic)].setdefault(event_date, {})[
+                                    fraction
+                                ] = float(prediction)
 
                 for _, assignment in civics.iterrows():
                     entity = build_entity(
@@ -380,6 +484,7 @@ def main() -> None:
     parser.add_argument("--assignments", type=Path, required=True)
     parser.add_argument("--classifier-model", type=Path, required=True)
     parser.add_argument("--regressor-model", type=Path, required=True)
+    parser.add_argument("--history", type=Path)
     parser.add_argument("--calendar", type=Path, required=True)
     parser.add_argument("--forecast-from-date", required=True)
     parser.add_argument("--forecast-to-date", required=True)
@@ -414,6 +519,7 @@ def main() -> None:
         forecast_end,
         args.orion_entity_type,
         args.stage_output,
+        args.history,
     )
     published = publish_twins(
         args.stage_output,

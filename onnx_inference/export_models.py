@@ -16,9 +16,11 @@ import onnx
 import onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper
 from sklearn.pipeline import Pipeline
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import DoubleTensorType
+from skl2onnx.operator_converters import random_forest as tree_converter
 
 
 SCHEMA_VERSION = 1
@@ -43,33 +45,75 @@ def fitted_scaler(means: np.ndarray, scales: np.ndarray) -> StandardScaler:
     return scaler
 
 
-def add_target_postprocessing(model: onnx.ModelProto) -> None:
+def add_target_postprocessing(
+    model: onnx.ModelProto,
+    target_transform: str,
+    model_name: str,
+    upper_bound: float | None,
+) -> None:
     if len(model.graph.output) != 1:
         raise ValueError("Expected the converted regressor to have one output.")
 
     log_output = model.graph.output[0].name
     del model.graph.output[:]
     model.graph.initializer.extend(
-        [
-            numpy_helper.from_array(
-                np.array([1.0], dtype=np.float64), "__post_one"
-            ),
-            numpy_helper.from_array(
-                np.array([0.0], dtype=np.float64), "__post_zero"
-            ),
-        ]
+        [numpy_helper.from_array(np.array([0.0], dtype=np.float64), "__post_zero")]
     )
-    model.graph.node.extend(
-        [
-            helper.make_node("Exp", [log_output], ["__post_exp"]),
-            helper.make_node(
-                "Sub", ["__post_exp", "__post_one"], ["__post_raw"]
-            ),
-            helper.make_node(
-                "Max", ["__post_raw", "__post_zero"], ["prediction_t"]
-            ),
-        ]
+    nonnegative_output = (
+        "__post_nonnegative" if upper_bound is not None else "prediction_t"
     )
+    if upper_bound is not None:
+        model.graph.initializer.extend(
+            [
+                numpy_helper.from_array(
+                    np.array([upper_bound], dtype=np.float64), "__post_upper"
+                )
+            ]
+        )
+    if model_name != "grouped_hist_gradient_boosting" and target_transform == "log1p":
+        model.graph.initializer.extend(
+            [numpy_helper.from_array(np.array([1.0], dtype=np.float64), "__post_one")]
+        )
+    if model_name == "grouped_hist_gradient_boosting":
+        model.graph.node.extend(
+            [
+                helper.make_node(
+                    "Cast", [log_output], ["__post_double"], to=TensorProto.DOUBLE
+                ),
+                helper.make_node("Exp", ["__post_double"], ["__post_raw"]),
+                helper.make_node(
+                    "Max", ["__post_raw", "__post_zero"], [nonnegative_output]
+                ),
+            ]
+        )
+    elif target_transform == "log1p":
+        model.graph.node.extend(
+            [
+                helper.make_node("Exp", [log_output], ["__post_exp"]),
+                helper.make_node(
+                    "Sub", ["__post_exp", "__post_one"], ["__post_raw"]
+                ),
+                helper.make_node(
+                    "Max", ["__post_raw", "__post_zero"], [nonnegative_output]
+                ),
+            ]
+        )
+    elif target_transform == "identity":
+        model.graph.node.extend(
+            [helper.make_node("Max", [log_output, "__post_zero"], [nonnegative_output])]
+        )
+    else:
+        raise ValueError(f"Unsupported target transform: {target_transform}")
+    if upper_bound is not None:
+        model.graph.node.extend(
+            [
+                helper.make_node(
+                    "Min",
+                    [nonnegative_output, "__post_upper"],
+                    ["prediction_t"],
+                )
+            ]
+        )
     model.graph.output.extend(
         [
             helper.make_tensor_value_info(
@@ -85,6 +129,8 @@ def validate_conversion(
     means: np.ndarray,
     scales: np.ndarray,
     numeric_count: int,
+    target_transform: str,
+    upper_bound: float | None,
 ) -> None:
     rows = np.vstack([means, means + scales])
     rows[:, numeric_count:] = 0.0
@@ -92,9 +138,42 @@ def validate_conversion(
     rows[1, numeric_count + 1] = 1.0
 
     normalized = ((rows - means) / scales).astype(np.float32)
-    expected = np.maximum(np.expm1(estimator.predict(normalized)), 0.0)
+    expected = estimator.predict(normalized)
+    if target_transform == "log1p":
+        expected = np.expm1(expected)
+    expected = np.maximum(expected, 0.0)
+    if upper_bound is not None:
+        expected = np.minimum(expected, upper_bound)
     actual = session.run(["prediction_t"], {"features": rows})[0].reshape(-1)
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def convert_pipeline(
+    pipeline: Pipeline, name: str, feature_count: int
+) -> onnx.ModelProto:
+    original = tree_converter.add_tree_to_attribute_pairs_hist_gradient_boosting
+
+    def compatible_hist_converter(*args, **kwargs):
+        # skl2onnx 1.20 forwards numpy booleans that ONNX 1.22 rejects as ints.
+        original(*args, **kwargs)
+        attrs = args[0]
+        attrs["nodes_missing_value_tracks_true"] = [
+            int(value) for value in attrs["nodes_missing_value_tracks_true"]
+        ]
+
+    if isinstance(pipeline[-1], HistGradientBoostingRegressor):
+        tree_converter.add_tree_to_attribute_pairs_hist_gradient_boosting = (
+            compatible_hist_converter
+        )
+    try:
+        return convert_sklearn(
+            pipeline,
+            name=name,
+            initial_types=[("features", DoubleTensorType([None, feature_count]))],
+            target_opset=TARGET_OPSET,
+        )
+    finally:
+        tree_converter.add_tree_to_attribute_pairs_hist_gradient_boosting = original
 
 
 def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
@@ -104,8 +183,14 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
         )
 
     bundle = joblib.load(input_path)
-    if bundle.get("model_name") != "grouped_sgd":
-        raise ValueError("Input is not a grouped_sgd model bundle.")
+    model_name = bundle.get("model_name")
+    if model_name not in {
+        "grouped_sgd",
+        "grouped_gpr",
+        "grouped_hist_gradient_boosting",
+    }:
+        raise ValueError("Input is not a supported grouped regressor bundle.")
+    target_transform = bundle.get("target_transform", "log1p")
 
     numeric_cols = list(bundle["numeric_cols"])
     feature_names = list(bundle["feature_names"])
@@ -135,6 +220,13 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
         ):
             estimator = info["model"]
             numeric_stats = info["numeric_stats"]
+            upper_bound = info.get("prediction_upper_bound_t")
+            if upper_bound is not None:
+                upper_bound = float(upper_bound)
+                if not np.isfinite(upper_bound) or upper_bound < 0:
+                    raise ValueError(
+                        f"Invalid prediction upper bound for {model_key}."
+                    )
             categorical_count = len(feature_names) - len(numeric_cols)
             means = np.array(
                 [numeric_stats[col][0] for col in numeric_cols]
@@ -157,15 +249,14 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
                     ("model", estimator),
                 ]
             )
-            onnx_model = convert_sklearn(
+            onnx_model = convert_pipeline(
                 pipeline,
-                name=f"grouped_sgd_{index:03d}",
-                initial_types=[
-                    ("features", DoubleTensorType([None, len(feature_names)]))
-                ],
-                target_opset=TARGET_OPSET,
+                f"{model_name}_{index:03d}",
+                len(feature_names),
             )
-            add_target_postprocessing(onnx_model)
+            add_target_postprocessing(
+                onnx_model, target_transform, model_name, upper_bound
+            )
             onnx.checker.check_model(onnx_model)
 
             relative_path = Path("models") / f"{index:03d}.onnx"
@@ -182,6 +273,8 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
                 means,
                 scales,
                 len(numeric_cols),
+                target_transform,
+                upper_bound,
             )
             del session
 
@@ -191,6 +284,11 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
                     "frazione": str(group_values["frazione"]),
                     "cluster_label": int(group_values["cluster_label"]),
                     "model": relative_path.as_posix(),
+                    **(
+                        {"prediction_upper_bound_t": float(upper_bound)}
+                        if upper_bound is not None
+                        else {}
+                    ),
                 }
             )
 
@@ -225,7 +323,7 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export a grouped SGD joblib bundle as an ONNX package."
+        description="Export a grouped regressor joblib bundle as an ONNX package."
     )
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

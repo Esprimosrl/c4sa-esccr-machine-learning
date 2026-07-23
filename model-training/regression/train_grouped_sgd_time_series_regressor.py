@@ -6,13 +6,23 @@ from dataclasses import dataclass
 from pathlib import Path
 import argparse
 import json
+import sys
 
 import duckdb
 import joblib
 import numpy as np
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from lag_features import LAG_FEATURES, LagState
+
 from sklearn.linear_model import SGDRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 
 CATEGORICAL_LEVELS = {
@@ -20,6 +30,7 @@ CATEGORICAL_LEVELS = {
 }
 
 GROUP_COLS = ["frazione", "cluster_label"]
+Regressor = SGDRegressor | GaussianProcessRegressor | HistGradientBoostingRegressor
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,9 @@ def get_feature_columns(
         "coord_y",
         "densita_locale",
         "giorni_accumulati",
+        "historical_annual_t",
+        "historical_collection_mean_t",
+        *LAG_FEATURES,
         "anno_ref",
         "month",
         "day_of_month",
@@ -250,6 +264,8 @@ def create_full_data_table(
                 {numeric_expr("coord_y", cols)},
                 {numeric_expr("densita_locale", cols)},
                 {numeric_expr("giorni_accumulati", cols)},
+                {numeric_expr("historical_annual_t", cols)},
+                {numeric_expr("historical_collection_mean_t", cols)},
                 {categorical_expr("zona_raccolta", cols)},
                 {categorical_expr("cluster_label", cols)},
                 {categorical_expr("frazione", cols)},
@@ -284,12 +300,70 @@ def create_full_data_table(
             WHERE {sql_ident(id_col)} IS NOT NULL
               AND data_dt IS NOT NULL
               AND target_value IS NOT NULL
+        ),
+        lagged AS (
+            SELECT
+                *,
+                COALESCE(
+                    lag(target_value) OVER (
+                        PARTITION BY {sql_ident(id_col)}, __group_frazione
+                        ORDER BY data_dt, __row_id
+                    ),
+                    0.0
+                ) AS lag_1_collection_t,
+                COALESCE(
+                    sum(target_value) OVER (
+                        PARTITION BY {sql_ident(id_col)}, __group_frazione
+                        ORDER BY data_dt
+                        RANGE BETWEEN INTERVAL 7 DAY PRECEDING
+                        AND INTERVAL 1 DAY PRECEDING
+                    ),
+                    0.0
+                ) AS rolling_7d_sum_t,
+                COALESCE(
+                    sum(target_value) OVER (
+                        PARTITION BY {sql_ident(id_col)}, __group_frazione
+                        ORDER BY data_dt
+                        RANGE BETWEEN INTERVAL 30 DAY PRECEDING
+                        AND INTERVAL 1 DAY PRECEDING
+                    ),
+                    0.0
+                ) AS rolling_30d_sum_t,
+                COALESCE(
+                    median(target_value) OVER (
+                        PARTITION BY {sql_ident(id_col)}, __group_frazione
+                        ORDER BY data_dt
+                        RANGE BETWEEN INTERVAL 90 DAY PRECEDING
+                        AND INTERVAL 1 DAY PRECEDING
+                    ),
+                    0.0
+                ) AS rolling_90d_median_t,
+                count(target_value) OVER (
+                    PARTITION BY {sql_ident(id_col)}, __group_frazione
+                    ORDER BY data_dt
+                    RANGE BETWEEN INTERVAL 90 DAY PRECEDING
+                    AND INTERVAL 1 DAY PRECEDING
+                )::DOUBLE AS rolling_90d_count,
+                COALESCE(
+                    date_diff(
+                        'day',
+                        max(CASE WHEN target_value > 0 THEN data_dt END) OVER (
+                            PARTITION BY {sql_ident(id_col)}, __group_frazione
+                            ORDER BY data_dt
+                            RANGE BETWEEN UNBOUNDED PRECEDING
+                            AND INTERVAL 1 DAY PRECEDING
+                        ),
+                        data_dt
+                    ),
+                    0
+                )::DOUBLE AS days_since_last_nonzero_collection
+            FROM eligible
         )
         SELECT
             *,
             row_number() OVER (ORDER BY data_dt, __row_id) AS __time_rank,
             count(*) OVER () AS __total_rows
-        FROM eligible;
+        FROM lagged;
     """)
 
 
@@ -457,16 +531,47 @@ def make_features(
     return np.hstack(feature_blocks).astype("float32")
 
 
-def make_target_log(series: pd.Series) -> np.ndarray:
+def make_target_raw(series: pd.Series) -> np.ndarray:
     y = pd.to_numeric(series, errors="coerce")
     y = y.fillna(0).clip(lower=0)
-    return np.log1p(y.to_numpy(dtype=np.float64))
+    return y.to_numpy(dtype=np.float64)
 
 
-def prediction_log_to_raw(pred_log: np.ndarray) -> np.ndarray:
-    pred = np.expm1(pred_log)
-    pred[~np.isfinite(pred)] = 0.0
-    return np.maximum(pred, 0)
+def make_target_log(series: pd.Series) -> np.ndarray:
+    return np.log1p(make_target_raw(series))
+
+
+def clip_raw_predictions(
+    predictions: np.ndarray, upper_bound: float | None = None
+) -> np.ndarray:
+    result = np.asarray(predictions, dtype=np.float64).copy()
+    result[~np.isfinite(result)] = 0.0
+    if upper_bound is not None:
+        return np.clip(result, 0.0, upper_bound)
+    return np.maximum(result, 0.0)
+
+
+def prediction_log_to_raw(
+    pred_log: np.ndarray, upper_bound: float | None = None
+) -> np.ndarray:
+    values = np.asarray(pred_log, dtype=np.float64)
+    if upper_bound is not None:
+        values = np.minimum(values, np.log1p(upper_bound))
+    with np.errstate(over="ignore", invalid="ignore"):
+        predictions = np.expm1(values)
+    return clip_raw_predictions(predictions, upper_bound)
+
+
+def prediction_to_raw(
+    model: Regressor,
+    features: np.ndarray,
+    target_transform: str,
+    upper_bound: float | None = None,
+) -> np.ndarray:
+    prediction = model.predict(features)
+    if target_transform == "log1p":
+        return prediction_log_to_raw(prediction, upper_bound)
+    return clip_raw_predictions(prediction, upper_bound)
 
 
 def make_progress_bar(enabled: bool, total: int, desc: str):
@@ -483,7 +588,31 @@ def make_progress_bar(enabled: bool, total: int, desc: str):
     return tqdm(total=total, desc=desc, unit="rows")
 
 
-def build_model(args: argparse.Namespace, group_index: int) -> SGDRegressor:
+def build_model(args: argparse.Namespace, group_index: int) -> Regressor:
+    if args.regressor == "gpr":
+        kernel = (
+            ConstantKernel(1.0, (1e-2, 1e2))
+            * RBF(1.0, (1e-2, 1e2))
+            + WhiteKernel(0.1, (1e-5, 1e1))
+        )
+        return GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=1e-6,
+            normalize_y=True,
+            n_restarts_optimizer=0,
+            random_state=args.seed + group_index,
+        )
+    if args.regressor == "hist_gradient_boosting":
+        return HistGradientBoostingRegressor(
+            loss="poisson",
+            learning_rate=0.05,
+            max_iter=300,
+            max_leaf_nodes=31,
+            l2_regularization=1.0,
+            early_stopping=False,
+            random_state=args.seed + group_index,
+        )
+
     return SGDRegressor(
         loss="squared_error",
         penalty=args.penalty,
@@ -556,6 +685,106 @@ def fit_sgd(
     return model
 
 
+def fetch_gpr_sample(
+    con: duckdb.DuckDBPyConnection,
+    group: GroupSpec,
+    cols: list[str],
+    max_rows: int,
+    seed: int,
+) -> pd.DataFrame:
+    selected_cols = ", ".join(sql_ident(c) for c in ["__time_rank"] + cols)
+    where_sql = group_where(group)
+    if group.train_rows <= max_rows:
+        return con.execute(f"""
+            SELECT {selected_cols}
+            FROM train_data
+            WHERE {where_sql}
+            ORDER BY __time_rank;
+        """).df()
+
+    return con.execute(f"""
+        WITH bucketed AS (
+            SELECT
+                {selected_cols},
+                ntile({int(max_rows)}) OVER (ORDER BY __time_rank) AS __sample_bucket
+            FROM train_data
+            WHERE {where_sql}
+        ),
+        sampled AS (
+            SELECT
+                *,
+                row_number() OVER (
+                    PARTITION BY __sample_bucket
+                    ORDER BY hash(__time_rank, {int(seed)})
+                ) AS __sample_rank
+            FROM bucketed
+        )
+        SELECT {selected_cols}
+        FROM sampled
+        WHERE __sample_rank = 1
+        ORDER BY __time_rank;
+    """).df()
+
+
+def fit_gpr(
+    con: duckdb.DuckDBPyConnection,
+    model: GaussianProcessRegressor,
+    group: GroupSpec,
+    max_rows: int,
+    feature_cols: list[str],
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    numeric_stats: dict[str, tuple[float, float]],
+    seed: int,
+) -> int:
+    sample = fetch_gpr_sample(
+        con,
+        group,
+        feature_cols + ["target_value"],
+        max_rows,
+        seed,
+    )
+    x = make_features(sample, numeric_cols, categorical_cols, numeric_stats)
+    y = make_target_log(sample["target_value"])
+    model.fit(x, y)
+    print(f"  fitted GPR with {len(sample)}/{group.train_rows} training rows")
+    return len(sample)
+
+
+def fetch_group_rows(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str,
+    group: GroupSpec,
+    cols: list[str],
+) -> pd.DataFrame:
+    selected_cols = ", ".join(sql_ident(c) for c in cols)
+    return con.execute(f"""
+        SELECT {selected_cols}
+        FROM {table_name}
+        WHERE {group_where(group)}
+        ORDER BY __time_rank;
+    """).df()
+
+
+def fit_hist_gradient_boosting(
+    con: duckdb.DuckDBPyConnection,
+    model: HistGradientBoostingRegressor,
+    group: GroupSpec,
+    feature_cols: list[str],
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    numeric_stats: dict[str, tuple[float, float]],
+) -> int:
+    columns = feature_cols + ["target_value"]
+    train = fetch_group_rows(con, "train_data", group, columns)
+    x_train = make_features(train, numeric_cols, categorical_cols, numeric_stats)
+    y_train = make_target_raw(train["target_value"])
+    model.set_params(early_stopping=False)
+    model.fit(x_train, y_train)
+    print(f"  fitted histogram booster with {len(train)} training rows")
+    return len(train)
+
+
 def empty_metric_sums() -> dict[str, float]:
     return {
         "rows": 0.0,
@@ -612,9 +841,132 @@ def metric_sums_to_row(
     }
 
 
+def lag_state_before_split(
+    con: duckdb.DuckDBPyConnection,
+    group: GroupSpec,
+    split_name: str,
+    id_col: str,
+) -> LagState:
+    split_start_rank, split_start_date = con.execute(f"""
+        SELECT min(__time_rank), min(data_dt)
+        FROM {split_name}_data;
+    """).fetchone()
+    state = LagState()
+    if split_start_rank is None:
+        return state
+
+    history = con.execute(f"""
+        WITH current_ids AS (
+            SELECT DISTINCT {sql_ident(id_col)} AS id_value
+            FROM {split_name}_data
+            WHERE {group_where(group)}
+        ),
+        past AS (
+            SELECT
+                f.{sql_ident(id_col)} AS id_value,
+                f.__group_frazione AS fraction_value,
+                f.data_dt,
+                f.__row_id,
+                f.target_value
+            FROM full_data f
+            JOIN current_ids c
+              ON f.{sql_ident(id_col)} = c.id_value
+            WHERE f.__time_rank < {int(split_start_rank)}
+              AND f.__group_frazione = {sql_lit(group.frazione)}
+        ),
+        selected AS (
+            SELECT *
+            FROM past
+            WHERE data_dt >= DATE {sql_lit(str(split_start_date))} - INTERVAL 90 DAY
+            UNION
+            SELECT *
+            FROM past
+            QUALIFY row_number() OVER (
+                PARTITION BY id_value
+                ORDER BY data_dt DESC, __row_id DESC
+            ) = 1
+            UNION
+            SELECT *
+            FROM past
+            WHERE target_value > 0
+            QUALIFY row_number() OVER (
+                PARTITION BY id_value
+                ORDER BY data_dt DESC, __row_id DESC
+            ) = 1
+        )
+        SELECT id_value, fraction_value, data_dt, target_value
+        FROM selected
+        ORDER BY id_value, data_dt, __row_id;
+    """).fetchall()
+    for civic, fraction, event_date, value in history:
+        state.add(civic, fraction, event_date, value)
+    return state
+
+
+def recursive_group_predictions(
+    con: duckdb.DuckDBPyConnection,
+    model: Regressor,
+    group: GroupSpec,
+    split_name: str,
+    id_col: str,
+    feature_cols: list[str],
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    numeric_stats: dict[str, tuple[float, float]],
+    target_transform: str,
+    prediction_upper_bound: float,
+) -> tuple[pd.DataFrame, np.ndarray, int]:
+    columns = list(
+        dict.fromkeys(
+            [
+                "__time_rank",
+                id_col,
+                "data_dt",
+                "frazione",
+                *feature_cols,
+                "target_value",
+            ]
+        )
+    )
+    frame = fetch_group_rows(
+        con, f"{split_name}_data", group, columns
+    ).reset_index(drop=True)
+    predictions = np.empty(len(frame), dtype=np.float64)
+    if frame.empty:
+        return frame, predictions, 0
+
+    state = lag_state_before_split(con, group, split_name, id_col)
+    batches = 0
+    for event_date, positions in frame.groupby("data_dt", sort=True).indices.items():
+        batch = frame.iloc[positions].copy()
+        lag_rows = [
+            state.features(civic, fraction, event_date)
+            for civic, fraction in zip(
+                batch[id_col], batch["frazione"], strict=True
+            )
+        ]
+        for name in LAG_FEATURES:
+            values = [row[name] for row in lag_rows]
+            batch[name] = values
+            frame.loc[positions, name] = values
+        raw_predictions = prediction_to_raw(
+            model,
+            make_features(batch, numeric_cols, categorical_cols, numeric_stats),
+            target_transform,
+            prediction_upper_bound,
+        )
+        predictions[positions] = raw_predictions
+        for civic, fraction, prediction in zip(
+            batch[id_col], batch["frazione"], raw_predictions, strict=True
+        ):
+            state.add(civic, fraction, event_date, float(prediction))
+        batches += 1
+    return frame, predictions, batches
+
+
 def evaluate_group_split(
     con: duckdb.DuckDBPyConnection,
-    model: SGDRegressor,
+    model: Regressor,
     group: GroupSpec,
     split_name: str,
     batch_size: int,
@@ -622,7 +974,36 @@ def evaluate_group_split(
     numeric_cols: list[str],
     categorical_cols: list[str],
     numeric_stats: dict[str, tuple[float, float]],
+    target_transform: str,
+    id_col: str,
+    prediction_upper_bound: float,
 ) -> dict[str, float]:
+    if split_name != "train":
+        frame, pred_raw, _ = recursive_group_predictions(
+            con,
+            model,
+            group,
+            split_name,
+            id_col,
+            feature_cols,
+            numeric_cols,
+            categorical_cols,
+            numeric_stats,
+            target_transform,
+            prediction_upper_bound,
+        )
+        y_raw = make_target_raw(frame["target_value"])
+        error = pred_raw - y_raw
+        log_error = np.log1p(pred_raw) - np.log1p(y_raw)
+        return {
+            "rows": float(len(y_raw)),
+            "abs_error_sum": float(np.abs(error).sum()),
+            "squared_error_sum": float((error * error).sum()),
+            "log_squared_error_sum": float((log_error * log_error).sum()),
+            "y_sum": float(y_raw.sum()),
+            "y_squared_sum": float((y_raw * y_raw).sum()),
+        }
+
     table_name = f"{split_name}_data"
     last_time_rank = 0
     sums = empty_metric_sums()
@@ -644,11 +1025,15 @@ def evaluate_group_split(
         x = make_features(batch, numeric_cols, categorical_cols, numeric_stats)
         y_log = make_target_log(batch["target_value"])
         y_raw = np.expm1(y_log)
-        pred_log = model.predict(x)
-        pred_raw = prediction_log_to_raw(pred_log)
+        prediction = model.predict(x)
+        if target_transform == "log1p":
+            pred_raw = prediction_log_to_raw(prediction, prediction_upper_bound)
+            log_error = np.log1p(pred_raw) - y_log
+        else:
+            pred_raw = clip_raw_predictions(prediction, prediction_upper_bound)
+            log_error = np.log1p(pred_raw) - y_log
 
         error = pred_raw - y_raw
-        log_error = pred_log - y_log
 
         n = len(y_raw)
         sums["rows"] += n
@@ -676,12 +1061,20 @@ def export_predictions(
     feature_cols: list[str],
     numeric_cols: list[str],
     categorical_cols: list[str],
+    target_transform: str,
+    id_col: str,
 ) -> int:
     con.execute("""
         CREATE OR REPLACE TEMP TABLE pred_store (
             __time_rank BIGINT,
             model_key VARCHAR,
-            pred_conferimento_t DOUBLE
+            pred_conferimento_t DOUBLE,
+            lag_1_collection_t DOUBLE,
+            rolling_7d_sum_t DOUBLE,
+            rolling_30d_sum_t DOUBLE,
+            rolling_90d_median_t DOUBLE,
+            rolling_90d_count DOUBLE,
+            days_since_last_nonzero_collection DOUBLE
         );
     """)
 
@@ -692,6 +1085,34 @@ def export_predictions(
         group = info["group"]
         model = info["model"]
         numeric_stats = info["numeric_stats"]
+        prediction_upper_bound = info["prediction_upper_bound_t"]
+        if split_name != "train":
+            frame, predictions, recursive_batches = recursive_group_predictions(
+                con,
+                model,
+                group,
+                split_name,
+                id_col,
+                feature_cols,
+                numeric_cols,
+                categorical_cols,
+                numeric_stats,
+                target_transform,
+                prediction_upper_bound,
+            )
+            pred_batch = pd.DataFrame(
+                {
+                    "__time_rank": frame["__time_rank"].to_numpy(),
+                    "model_key": model_key,
+                    "pred_conferimento_t": predictions,
+                    **{name: frame[name].to_numpy() for name in LAG_FEATURES},
+                }
+            )
+            con.register("pred_batch", pred_batch)
+            con.execute("INSERT INTO pred_store SELECT * FROM pred_batch;")
+            con.unregister("pred_batch")
+            batches += recursive_batches
+            continue
         last_time_rank = 0
 
         while True:
@@ -708,13 +1129,16 @@ def export_predictions(
 
             last_time_rank = int(batch["__time_rank"].max())
             x = make_features(batch, numeric_cols, categorical_cols, numeric_stats)
-            predictions = prediction_log_to_raw(model.predict(x))
+            predictions = prediction_to_raw(
+                model, x, target_transform, prediction_upper_bound
+            )
 
             pred_batch = pd.DataFrame(
                 {
                     "__time_rank": batch["__time_rank"].to_numpy(),
                     "model_key": model_key,
                     "pred_conferimento_t": predictions,
+                    **{name: batch[name].to_numpy() for name in LAG_FEATURES},
                 }
             )
             con.register("pred_batch", pred_batch)
@@ -726,9 +1150,10 @@ def export_predictions(
     con.execute(f"""
         COPY (
             SELECT
-                f.*,
+                f.* EXCLUDE ({", ".join(LAG_FEATURES)}),
                 p.model_key,
                 p.pred_conferimento_t,
+                {", ".join(f"p.{name}" for name in LAG_FEATURES)},
                 p.pred_conferimento_t - f.target_value AS prediction_error,
                 abs(p.pred_conferimento_t - f.target_value) AS absolute_error
             FROM {table_name} f
@@ -780,42 +1205,69 @@ def save_model_bundle(
                 "cluster_label": group.cluster_label,
             },
             "train_rows": group.train_rows,
+            "fit_rows": info["fit_rows"],
             "numeric_stats": info["numeric_stats"],
+            "prediction_upper_bound_t": info["prediction_upper_bound_t"],
         }
 
-    args.model_output.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(
-        {
-            "model_name": "grouped_sgd",
-            "model_display_name": "Grouped SGDRegressor",
-            "group_cols": GROUP_COLS,
-            "models": serializable_models,
-            "numeric_cols": numeric_cols,
-            "categorical_cols": categorical_cols,
-            "categorical_levels": CATEGORICAL_LEVELS,
-            "feature_names": feature_names(numeric_cols, categorical_cols),
-            "target_transform": "log1p",
-            "inverse_target_transform": "expm1_clipped_at_zero",
-            "target_col": args.target_col,
-            "date_col": args.date_col,
-            "id_col": args.id_col,
-            "split_ratios": args.split_ratios,
-            "split_counts": split_counts,
-            "date_ranges": date_ranges,
-            "metrics": metrics,
-            "min_train_rows": args.min_train_rows,
-        },
-        args.model_output,
+    model_name = f"grouped_{args.regressor}"
+    model_display_name = {
+        "sgd": "Grouped SGDRegressor",
+        "gpr": "Grouped GaussianProcessRegressor",
+        "hist_gradient_boosting": "Grouped HistGradientBoostingRegressor",
+    }[args.regressor]
+    target_transform = (
+        "identity" if args.regressor == "hist_gradient_boosting" else "log1p"
     )
+    bundle = {
+        "model_name": model_name,
+        "model_display_name": model_display_name,
+        "group_cols": GROUP_COLS,
+        "models": serializable_models,
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "categorical_levels": CATEGORICAL_LEVELS,
+        "feature_names": feature_names(numeric_cols, categorical_cols),
+        "lag_features": list(LAG_FEATURES),
+        "held_out_lag_strategy": "recursive_predictions",
+        "target_transform": target_transform,
+        "inverse_target_transform": (
+            "clipped_at_zero"
+            if target_transform == "identity"
+            else "expm1_clipped_at_zero"
+        ),
+        "target_col": args.target_col,
+        "date_col": args.date_col,
+        "id_col": args.id_col,
+        "split_ratios": args.split_ratios,
+        "split_counts": split_counts,
+        "date_ranges": date_ranges,
+        "metrics": metrics,
+        "min_train_rows": args.min_train_rows,
+    }
+    if args.regressor == "gpr":
+        bundle.update(
+            gpr_max_train_rows=args.gpr_max_train_rows,
+            sampling="seeded row from each chronological ntile bucket",
+        )
+
+    args.model_output.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(bundle, args.model_output)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train one SGDRegressor per frazione/cluster_label pair using "
+            "Train one regressor per frazione/cluster_label pair using "
             "chronological train/validation/test splits."
         )
     )
+    parser.add_argument(
+        "--regressor",
+        choices=["sgd", "gpr", "hist_gradient_boosting"],
+        default="sgd",
+    )
+    parser.add_argument("--gpr-max-train-rows", type=int, default=500)
     parser.add_argument(
         "--input",
         type=Path,
@@ -871,12 +1323,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-output",
         type=Path,
-        default=Path("models/grouped_sgd_time_series.joblib"),
     )
     parser.add_argument(
         "--metrics-output",
         type=Path,
-        default=Path("grouped_sgd_time_series_metrics.csv"),
     )
     parser.add_argument("--predictions-output", type=Path)
     parser.add_argument(
@@ -907,6 +1357,14 @@ def main() -> None:
         raise ValueError("--batch-size must be greater than zero.")
     if args.min_train_rows <= 0:
         raise ValueError("--min-train-rows must be greater than zero.")
+    if args.gpr_max_train_rows <= 0:
+        raise ValueError("--gpr-max-train-rows must be greater than zero.")
+
+    artifact_stem = f"grouped_{args.regressor}_time_series"
+    if args.model_output is None:
+        args.model_output = Path("models") / f"{artifact_stem}.joblib"
+    if args.metrics_output is None:
+        args.metrics_output = Path(f"{artifact_stem}_metrics.csv")
 
     con = duckdb.connect()
     if args.duckdb_memory_limit:
@@ -943,6 +1401,9 @@ def main() -> None:
 
     groups = discover_groups(con, args.min_train_rows)
     print(f"training {len(groups)} frazione/cluster_label models")
+    target_transform = (
+        "identity" if args.regressor == "hist_gradient_boosting" else "log1p"
+    )
 
     trained_models: dict[str, dict[str, object]] = {}
     for idx, group in enumerate(groups, start=1):
@@ -954,23 +1415,58 @@ def main() -> None:
             numeric_cols=numeric_cols,
             where_sql=where_sql,
         )
-        model = build_model(args, idx - 1)
-        fit_sgd(
-            con=con,
-            model=model,
-            group=group,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            feature_cols=feature_cols,
-            numeric_cols=numeric_cols,
-            categorical_cols=categorical_cols,
-            numeric_stats=numeric_stats,
-            progress=args.progress,
+        prediction_upper_bound = float(
+            con.execute(f"""
+                SELECT max(target_value)
+                FROM train_data
+                WHERE {where_sql};
+            """).fetchone()[0]
         )
+        if not np.isfinite(prediction_upper_bound) or prediction_upper_bound < 0:
+            raise ValueError(f"Invalid training target maximum for {group.key}.")
+        model = build_model(args, idx - 1)
+        if isinstance(model, GaussianProcessRegressor):
+            fit_rows = fit_gpr(
+                con=con,
+                model=model,
+                group=group,
+                max_rows=args.gpr_max_train_rows,
+                feature_cols=feature_cols,
+                numeric_cols=numeric_cols,
+                categorical_cols=categorical_cols,
+                numeric_stats=numeric_stats,
+                seed=args.seed + idx - 1,
+            )
+        elif isinstance(model, HistGradientBoostingRegressor):
+            fit_rows = fit_hist_gradient_boosting(
+                con=con,
+                model=model,
+                group=group,
+                feature_cols=feature_cols,
+                numeric_cols=numeric_cols,
+                categorical_cols=categorical_cols,
+                numeric_stats=numeric_stats,
+            )
+        else:
+            fit_sgd(
+                con=con,
+                model=model,
+                group=group,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                feature_cols=feature_cols,
+                numeric_cols=numeric_cols,
+                categorical_cols=categorical_cols,
+                numeric_stats=numeric_stats,
+                progress=args.progress,
+            )
+            fit_rows = group.train_rows
         trained_models[group.key] = {
             "group": group,
             "model": model,
             "numeric_stats": numeric_stats,
+            "fit_rows": fit_rows,
+            "prediction_upper_bound_t": prediction_upper_bound,
         }
 
     metrics: list[dict[str, float | str]] = []
@@ -984,6 +1480,7 @@ def main() -> None:
         group = info["group"]
         model = info["model"]
         numeric_stats = info["numeric_stats"]
+        prediction_upper_bound = info["prediction_upper_bound_t"]
 
         for split_name in ["train", "validation", "test"]:
             sums = evaluate_group_split(
@@ -996,6 +1493,9 @@ def main() -> None:
                 numeric_cols=numeric_cols,
                 categorical_cols=categorical_cols,
                 numeric_stats=numeric_stats,
+                target_transform=target_transform,
+                id_col=args.id_col,
+                prediction_upper_bound=prediction_upper_bound,
             )
             add_metric_sums(aggregate_sums[split_name], sums)
             metrics.append(
@@ -1051,6 +1551,8 @@ def main() -> None:
             feature_cols=feature_cols,
             numeric_cols=numeric_cols,
             categorical_cols=categorical_cols,
+            target_transform=target_transform,
+            id_col=args.id_col,
         )
         print(
             f"saved {args.predictions_split} predictions to "
