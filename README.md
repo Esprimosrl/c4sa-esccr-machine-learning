@@ -138,6 +138,133 @@ Il comando principale è:
 ./run_pipeline.sh
 ```
 
+### Benchmark sui Parquet completi
+
+Il nuovo flusso batch per ritiro programmato usa direttamente i tre Parquet
+completi. Prima della regressione addestra K-means sui dati annuali dei civici
+e aggiunge `cluster_label` a ogni riga del Parquet dei conferimenti:
+
+```bash
+./run_pipeline.sh \
+  --source complete-parquet \
+  --output-dir artifacts/zone-fraction-seed42
+```
+
+I percorsi predefiniti sono
+`andria_distribuzione_annuale_completa.parquet`,
+`produzione_giornaliera_completa.parquet` e
+`conferimenti_giornalieri_completi.parquet` nella directory
+`data_csv_parquet`. Possono essere sostituiti con `--annual-input`,
+`--production-input` e `--collections-input`.
+
+La preparazione proietta e aggrega i Parquet con DuckDB per
+zona/frazione/cluster, riconcilia produzione, conferimenti e totali annuali,
+completa i ritiri a zero dal calendario e mantiene lo spillover. Il training si
+ferma al 31 dicembre e usa lo split cronologico gennaio-settembre,
+ottobre-novembre e dicembre; confronta baseline, Ridge, il regressore lineare
+SGD del flusso precedente e histogram gradient boosting, e produce anche i
+quantili 0,50 e 0,90 per le frazioni episodiche.
+`cluster_label` è una feature categorica del modello tabellare e identifica le
+serie usate da Ridge, SGD e histogram gradient boosting. SARIMA e SARIMAX
+aggregano invece i cluster e addestrano una serie per coppia zona/frazione.
+
+Per selezionare il modello con cross-validation temporale a finestra crescente,
+lasciando dicembre come test finale:
+
+```bash
+./run_pipeline.sh \
+  --source complete-parquet \
+  --validation-strategy k-fold \
+  --validation-folds 5 \
+  --output-dir artifacts/zone-fraction-seed42
+```
+
+La strategia predefinita resta `fixed`, con ottobre-novembre come intervallo di
+validation. `--validation-folds` viene usato soltanto dalla strategia `k-fold`.
+
+Per escludere completamente le frazioni episodiche da training, selezione,
+metriche e predizioni:
+
+```bash
+./run_pipeline.sh \
+  --source complete-parquet \
+  --exclude-episodic-fractions \
+  --output-dir artifacts/zone-fraction-seed42
+```
+
+Le feature storiche comprendono il ritiro precedente, il valore osservato
+esattamente sette giorni prima, le statistiche degli ultimi quattro ritiri e
+media, somma e conteggio dei ritiri nei sette giorni precedenti. Tutte le
+finestre escludono il target corrente.
+
+La loss HGB predefinita è `poisson`. Per un confronto esplicito:
+
+```bash
+./run_pipeline.sh \
+  --source complete-parquet \
+  --hgb-loss squared_error \
+  --output-dir artifacts/zone-fraction-squared-error
+```
+
+Per eseguire anche il confronto SARIMA/SARIMAX per zona e frazione:
+
+```bash
+./run_pipeline.sh \
+  --source complete-parquet \
+  --exclude-episodic-fractions \
+  --include-arima \
+  --output-dir artifacts/zone-fraction-seed42
+```
+
+SARIMA usa una frequenza giornaliera e stagionalità settimanale, ma mantiene i
+giorni non programmati come osservazioni mancanti invece di trasformarli in
+target zero. SARIMAX viene selezionato e valutato in parallelo, usando come
+regressori noti l'intervallo dal ritiro programmato precedente e le festività
+nazionali italiane (con il giorno successivo); le festività non modificano il
+calendario di raccolta. Ordine e ordine stagionale vengono scelti sul WAPE di
+validation; il test viene confrontato anche con il valore osservato sette
+giorni prima.
+Anche il sottocomando `arima` accetta `--validation-strategy k-fold` e
+`--validation-folds`; in questa modalità seleziona gli ordini sul WAPE medio
+dei fold temporali.
+
+I totali di test di SARIMA, SARIMAX e della baseline stagionale vengono inoltre
+ripartiti su tutti i civici della stessa zona. I pesi
+sono calcolati esclusivamente dai conferimenti precedenti al 1 dicembre; i
+civici senza storico ricevono peso zero e, se tutto il gruppo è privo di
+storico, vengono usate quote uguali. Il riepilogo stampa il WAPE aggregato,
+quello per civico e il relativo incremento.
+
+Per le frazioni incluse, la ripartizione confronta il peso storico con un
+`BayesianRidge` e un modello empirico-Bayes Dirichlet. La selezione usa
+ottobre-novembre, richiede prima una copertura almeno del 90% e poi minimizza
+il WAPE civico. Le previsioni di dicembre includono gli estremi inferiore e
+superiore; ogni previsione puntuale continua a sommare esattamente al totale
+zona/frazione. Il benchmark non usa produzione o conferimenti futuri e non usa
+`cluster_label`, perché deriva dai totali annuali completi.
+
+Gli output principali sono:
+
+```text
+artifacts/zone-fraction-seed42/
+├── data/kmeans_assignments.parquet
+├── data/conferimenti_giornalieri_classificati.parquet
+├── data/static_civics.parquet
+├── data/withdrawals/scenario_seed=42/part-000.parquet
+├── manifest.json
+├── models/kmeans_model.joblib
+├── metrics/zone_fraction_benchmark_metrics.csv
+├── metrics/zone_fraction_arima_civic_metrics.csv
+├── metrics/zone_fraction_arima_allocator_benchmark.csv
+├── models/zone_fraction_benchmark.joblib
+├── predictions/zone_fraction_test_predictions.parquet
+└── predictions/zone_fraction_arima_test_predictions_per_civic.parquet
+```
+
+Il flusso corrente dichiara `scenario_seed=42`; il seed non viene usato come
+feature. `--missing-calendar-mode error` è il comportamento predefinito e può
+essere sostituito esplicitamente con `daily`.
+
 La sorgente predefinita è il file locale. Il flusso eseguito è:
 
 ```text

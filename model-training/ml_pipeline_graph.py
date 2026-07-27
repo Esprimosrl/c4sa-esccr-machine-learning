@@ -338,6 +338,220 @@ def build_graph(
     return graph
 
 
+def build_complete_parquet_graph(
+    python: str,
+    model_seed: str,
+    year: str,
+    output_dir: Path,
+    annual_input: Path,
+    production_input: Path,
+    collections_input: Path,
+    calendar_input: Path,
+    annual_seed: int = 42,
+    scenario_seed: int = 42,
+    spillover_days: int = 14,
+    missing_calendar_mode: str = "error",
+    generator_version: str = "unversioned-current",
+    exclude_episodic_fractions: bool = False,
+    hgb_loss: str = "poisson",
+    include_arima: bool = False,
+    validation_strategy: str = "fixed",
+    validation_folds: int = 5,
+) -> dict[str, Node]:
+    output_dir = local_path(output_dir, str(output_dir))
+    annual_input = local_path(annual_input, str(annual_input))
+    production_input = local_path(production_input, str(production_input))
+    collections_input = local_path(collections_input, str(collections_input))
+    calendar_input = local_path(calendar_input, str(calendar_input))
+    assignments = output_dir / "data" / "kmeans_assignments.parquet"
+    classified_collections = (
+        output_dir / "data" / "conferimenti_giornalieri_classificati.parquet"
+    )
+    classifier_model = output_dir / "models" / "kmeans_model.joblib"
+    withdrawals = (
+        output_dir
+        / "data"
+        / "withdrawals"
+        / f"scenario_seed={scenario_seed}"
+        / "part-000.parquet"
+    )
+    static_civics = output_dir / "data" / "static_civics.parquet"
+    manifest = output_dir / "manifest.json"
+    model = output_dir / "models" / "zone_fraction_benchmark.joblib"
+    metrics = output_dir / "metrics" / "zone_fraction_benchmark_metrics.csv"
+    predictions = (
+        output_dir / "predictions" / "zone_fraction_test_predictions.parquet"
+    )
+    arima_model = output_dir / "models" / "zone_fraction_arima.joblib"
+    arima_metrics = output_dir / "metrics" / "zone_fraction_arima_metrics.csv"
+    arima_predictions = (
+        output_dir
+        / "predictions"
+        / "zone_fraction_arima_test_predictions.parquet"
+    )
+    arima_civic_predictions = (
+        output_dir
+        / "predictions"
+        / "zone_fraction_arima_test_predictions_per_civic.parquet"
+    )
+    arima_civic_metrics = (
+        output_dir / "metrics" / "zone_fraction_arima_civic_metrics.csv"
+    )
+    arima_allocator_metrics = (
+        output_dir / "metrics" / "zone_fraction_arima_allocator_benchmark.csv"
+    )
+    script = "model-training/zone_fraction_benchmark.py"
+    graph = {
+        "kmeans": Node(
+            name="kmeans",
+            command=[
+                python,
+                "model-training/classification/train_kmeans.py",
+                "--input",
+                str(annual_input),
+                "--n-clusters",
+                "6",
+                "--output",
+                str(assignments),
+                "--output-format",
+                "parquet",
+                "--model-output",
+                str(classifier_model),
+                "--coord-weight",
+                "8",
+                "--annual-kg-weight",
+                "0.5",
+                "--other-numeric-weight",
+                "1",
+                "--categorical-weight",
+                "1",
+                "--seed",
+                model_seed,
+            ],
+            inputs=(annual_input,),
+            outputs=(assignments, classifier_model),
+        ),
+        "classify_collections": Node(
+            name="classify_collections",
+            command=[
+                python,
+                script,
+                "classify",
+                "--collections-input",
+                str(collections_input),
+                "--assignments-input",
+                str(assignments),
+                "--output",
+                str(classified_collections),
+            ],
+            inputs=(collections_input, assignments),
+            outputs=(classified_collections,),
+            needs=("kmeans",),
+        ),
+        "prepare_zone_fraction": Node(
+            name="prepare_zone_fraction",
+            command=[
+                python,
+                script,
+                "prepare",
+                "--annual-input",
+                str(annual_input),
+                "--production-input",
+                str(production_input),
+                "--collections-input",
+                str(classified_collections),
+                "--calendar-input",
+                str(calendar_input),
+                "--output-dir",
+                str(output_dir),
+                "--year",
+                year,
+                "--annual-seed",
+                str(annual_seed),
+                "--scenario-seed",
+                str(scenario_seed),
+                "--spillover-days",
+                str(spillover_days),
+                "--missing-calendar-mode",
+                missing_calendar_mode,
+                "--generator-version",
+                generator_version,
+            ],
+            inputs=(
+                annual_input,
+                production_input,
+                classified_collections,
+                calendar_input,
+            ),
+            outputs=(withdrawals, static_civics, manifest),
+            needs=("classify_collections",),
+        ),
+        "train_zone_fraction": Node(
+            name="train_zone_fraction",
+            command=[
+                python,
+                script,
+                "train",
+                "--input",
+                str(withdrawals),
+                "--output-dir",
+                str(output_dir),
+                "--seed",
+                model_seed,
+                "--hgb-loss",
+                hgb_loss,
+                "--validation-strategy",
+                validation_strategy,
+                "--validation-folds",
+                str(validation_folds),
+                *(
+                    ["--exclude-episodic-fractions"]
+                    if exclude_episodic_fractions
+                    else []
+                ),
+            ],
+            inputs=(withdrawals, manifest),
+            outputs=(model, metrics, predictions),
+            needs=("prepare_zone_fraction",),
+        ),
+    }
+    if include_arima:
+        graph["train_zone_fraction_arima"] = Node(
+            name="train_zone_fraction_arima",
+            command=[
+                python,
+                script,
+                "arima",
+                "--input",
+                str(withdrawals),
+                "--civic-input",
+                str(classified_collections),
+                "--output-dir",
+                str(output_dir),
+                "--validation-strategy",
+                validation_strategy,
+                "--validation-folds",
+                str(validation_folds),
+                *(
+                    ["--exclude-episodic-fractions"]
+                    if exclude_episodic_fractions
+                    else []
+                ),
+            ],
+            inputs=(withdrawals, classified_collections, manifest),
+            outputs=(
+                arima_model,
+                arima_metrics,
+                arima_predictions,
+                arima_civic_predictions,
+                arima_civic_metrics,
+                arima_allocator_metrics,
+            ),
+            needs=("prepare_zone_fraction",),
+        )
+    return graph
+
+
 def build_quantumleap_graph(
     python: str,
     seed: str,
@@ -680,7 +894,48 @@ def main() -> None:
     parser.add_argument(
         "--arima-group-by", choices=["cluster", "zone"], default="cluster"
     )
-    parser.add_argument("--source", choices=["file", "quantumleap"], default="file")
+    parser.add_argument(
+        "--source",
+        choices=["file", "quantumleap", "complete-parquet"],
+        default="file",
+    )
+    parser.add_argument(
+        "--annual-input",
+        type=Path,
+        default=Path(
+            "data_csv_parquet/andria_distribuzione_annuale_completa.parquet"
+        ),
+    )
+    parser.add_argument(
+        "--production-input",
+        type=Path,
+        default=Path("data_csv_parquet/produzione_giornaliera_completa.parquet"),
+    )
+    parser.add_argument(
+        "--collections-input",
+        type=Path,
+        default=Path("data_csv_parquet/conferimenti_giornalieri_completi.parquet"),
+    )
+    parser.add_argument("--annual-seed", type=int, default=42)
+    parser.add_argument("--scenario-seed", type=int, default=42)
+    parser.add_argument("--spillover-days", type=int, default=14)
+    parser.add_argument(
+        "--missing-calendar-mode", choices=["error", "daily"], default="error"
+    )
+    parser.add_argument("--generator-version", default="unversioned-current")
+    parser.add_argument("--exclude-episodic-fractions", action="store_true")
+    parser.add_argument(
+        "--hgb-loss",
+        choices=["poisson", "squared_error"],
+        default="poisson",
+    )
+    parser.add_argument(
+        "--validation-strategy",
+        choices=["fixed", "k-fold"],
+        default="fixed",
+    )
+    parser.add_argument("--validation-folds", type=int, default=5)
+    parser.add_argument("--include-arima", action="store_true")
     parser.add_argument(
         "--calendar-input",
         type=Path,
@@ -753,6 +1008,10 @@ def main() -> None:
 
     if args.gpr_max_train_rows <= 0:
         parser.error("--gpr-max-train-rows must be greater than zero")
+    if args.spillover_days < 0:
+        parser.error("--spillover-days must be non-negative")
+    if args.validation_strategy == "k-fold" and args.validation_folds < 2:
+        parser.error("--validation-folds must be at least 2")
 
     if bool(args.forecast_from_date) != bool(args.forecast_to_date):
         parser.error(
@@ -812,6 +1071,35 @@ def main() -> None:
             parser.error("forecast dates must be after --to-date")
         if args.orion_timeout_seconds <= 0 or args.orion_batch_size <= 0:
             parser.error("Orion timeout and batch size must be greater than zero")
+
+    if args.source == "complete-parquet":
+        if args.output_dir is None:
+            parser.error("--output-dir is required for --source complete-parquet")
+        graph = build_complete_parquet_graph(
+            args.python,
+            args.seed,
+            args.anno,
+            args.output_dir,
+            args.annual_input,
+            args.production_input,
+            args.collections_input,
+            args.calendar_input,
+            args.annual_seed,
+            args.scenario_seed,
+            args.spillover_days,
+            args.missing_calendar_mode,
+            args.generator_version,
+            args.exclude_episodic_fractions,
+            args.hgb_loss,
+            args.include_arima,
+            args.validation_strategy,
+            args.validation_folds,
+        )
+        if args.print_graph:
+            print_mermaid(graph)
+            return
+        run_graph(graph, force=args.force, dry_run=args.dry_run)
+        return
 
     if args.source == "file":
         graph = build_graph(

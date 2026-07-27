@@ -58,6 +58,49 @@ def load_module(name: str, path: str):
     return module
 
 
+def test_grouped_regressor_fixed_date_split_and_wape():
+    con = duckdb.connect()
+    con.execute("""
+        CREATE TABLE full_data AS
+        SELECT *
+        FROM (
+            VALUES
+                (DATE '2024-09-30', 1),
+                (DATE '2024-10-01', 2),
+                (DATE '2024-11-30', 3),
+                (DATE '2024-12-01', 4),
+                (DATE '2024-12-31', 5),
+                (DATE '2025-01-01', 6)
+        ) AS rows(data_dt, __time_rank)
+    """)
+
+    counts = trainer.create_split_tables(
+        con,
+        (0.7, 0.2, 0.1),
+        train_end=trainer.date(2024, 9, 30),
+        validation_end=trainer.date(2024, 11, 30),
+        test_end=trainer.date(2024, 12, 31),
+    )
+
+    assert counts == {"train": 1, "validation": 2, "test": 2}
+    row = trainer.metric_sums_to_row(
+        {
+            "rows": 2.0,
+            "abs_error_sum": 3.0,
+            "squared_error_sum": 5.0,
+            "log_squared_error_sum": 1.0,
+            "y_sum": 6.0,
+            "y_abs_sum": 6.0,
+            "y_squared_sum": 20.0,
+        },
+        "test",
+        "__all_trained_models__",
+        "__all__",
+        "__all__",
+    )
+    assert row["wape"] == pytest.approx(0.5)
+
+
 prepare = load_module("prepare_quantumleap", "model-training/prepare_quantumleap.py")
 pipeline = load_module("ml_pipeline_graph", "model-training/ml_pipeline_graph.py")
 trainer = load_module(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 import argparse
 import json
@@ -162,6 +163,13 @@ def parse_penalty(value: str) -> str | None:
     if value in {"l2", "l1", "elasticnet"}:
         return value
     raise argparse.ArgumentTypeError("Expected one of: l2, l1, elasticnet, none.")
+
+
+def parse_iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected a date in YYYY-MM-DD format.") from exc
 
 
 def get_feature_columns(
@@ -370,25 +378,55 @@ def create_full_data_table(
 def create_split_tables(
     con: duckdb.DuckDBPyConnection,
     split_ratios: tuple[float, float, float],
+    train_end: date | None = None,
+    validation_end: date | None = None,
+    test_end: date | None = None,
 ) -> dict[str, int]:
     total_rows = con.execute("SELECT count(*) FROM full_data;").fetchone()[0]
     if total_rows < 3:
         raise ValueError("Need at least three target rows for train/validation/test.")
 
-    train_ratio, validation_ratio, _ = split_ratios
-    train_cutoff = max(1, int(total_rows * train_ratio))
-    validation_cutoff = max(
-        train_cutoff + 1, int(total_rows * (train_ratio + validation_ratio))
-    )
-    validation_cutoff = min(validation_cutoff, total_rows - 1)
+    if train_end is not None or validation_end is not None or test_end is not None:
+        if train_end is None or validation_end is None:
+            raise ValueError(
+                "--train-end and --validation-end are both required for fixed splits."
+            )
+        if train_end >= validation_end:
+            raise ValueError("--train-end must be earlier than --validation-end.")
+        if test_end is not None and validation_end >= test_end:
+            raise ValueError("--test-end must be later than --validation-end.")
+        test_limit = (
+            f" AND data_dt <= DATE {sql_lit(test_end.isoformat())}"
+            if test_end is not None
+            else ""
+        )
+        split_sql = {
+            "train": f"data_dt <= DATE {sql_lit(train_end.isoformat())}",
+            "validation": (
+                f"data_dt > DATE {sql_lit(train_end.isoformat())} "
+                f"AND data_dt <= DATE {sql_lit(validation_end.isoformat())}"
+            ),
+            "test": (
+                f"data_dt > DATE {sql_lit(validation_end.isoformat())}"
+                f"{test_limit}"
+            ),
+        }
+    else:
+        train_ratio, validation_ratio, _ = split_ratios
+        train_cutoff = max(1, int(total_rows * train_ratio))
+        validation_cutoff = max(
+            train_cutoff + 1, int(total_rows * (train_ratio + validation_ratio))
+        )
+        validation_cutoff = min(validation_cutoff, total_rows - 1)
 
-    split_sql = {
-        "train": f"__time_rank <= {train_cutoff}",
-        "validation": (
-            f"__time_rank > {train_cutoff} AND __time_rank <= {validation_cutoff}"
-        ),
-        "test": f"__time_rank > {validation_cutoff}",
-    }
+        split_sql = {
+            "train": f"__time_rank <= {train_cutoff}",
+            "validation": (
+                f"__time_rank > {train_cutoff} "
+                f"AND __time_rank <= {validation_cutoff}"
+            ),
+            "test": f"__time_rank > {validation_cutoff}",
+        }
 
     counts = {}
     for split_name, where_sql in split_sql.items():
@@ -792,6 +830,7 @@ def empty_metric_sums() -> dict[str, float]:
         "squared_error_sum": 0.0,
         "log_squared_error_sum": 0.0,
         "y_sum": 0.0,
+        "y_abs_sum": 0.0,
         "y_squared_sum": 0.0,
     }
 
@@ -816,6 +855,7 @@ def metric_sums_to_row(
             "mae": np.nan,
             "rmse": np.nan,
             "log_rmse": np.nan,
+            "wape": np.nan,
             "r2": np.nan,
         }
 
@@ -837,6 +877,11 @@ def metric_sums_to_row(
         "mae": sums["abs_error_sum"] / n_rows,
         "rmse": float(np.sqrt(sums["squared_error_sum"] / n_rows)),
         "log_rmse": float(np.sqrt(sums["log_squared_error_sum"] / n_rows)),
+        "wape": (
+            sums["abs_error_sum"] / sums["y_abs_sum"]
+            if sums["y_abs_sum"] != 0
+            else np.nan
+        ),
         "r2": float(r2),
     }
 
@@ -1001,6 +1046,7 @@ def evaluate_group_split(
             "squared_error_sum": float((error * error).sum()),
             "log_squared_error_sum": float((log_error * log_error).sum()),
             "y_sum": float(y_raw.sum()),
+            "y_abs_sum": float(np.abs(y_raw).sum()),
             "y_squared_sum": float((y_raw * y_raw).sum()),
         }
 
@@ -1041,6 +1087,7 @@ def evaluate_group_split(
         sums["squared_error_sum"] += float((error * error).sum())
         sums["log_squared_error_sum"] += float((log_error * log_error).sum())
         sums["y_sum"] += float(y_raw.sum())
+        sums["y_abs_sum"] += float(np.abs(y_raw).sum())
         sums["y_squared_sum"] += float((y_raw * y_raw).sum())
 
     return sums
@@ -1240,6 +1287,19 @@ def save_model_bundle(
         "date_col": args.date_col,
         "id_col": args.id_col,
         "split_ratios": args.split_ratios,
+        "split_dates": {
+            "train_end": (
+                args.train_end.isoformat() if args.train_end is not None else None
+            ),
+            "validation_end": (
+                args.validation_end.isoformat()
+                if args.validation_end is not None
+                else None
+            ),
+            "test_end": (
+                args.test_end.isoformat() if args.test_end is not None else None
+            ),
+        },
         "split_counts": split_counts,
         "date_ranges": date_ranges,
         "metrics": metrics,
@@ -1285,6 +1345,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=(0.70, 0.20, 0.10),
         metavar="TRAIN,VALIDATION,TEST",
         help="Chronological split ratios. Accepts 0.7,0.2,0.1 or 70,20,10.",
+    )
+    parser.add_argument(
+        "--train-end",
+        type=parse_iso_date,
+        help="Inclusive training end date for a fixed chronological split.",
+    )
+    parser.add_argument(
+        "--validation-end",
+        type=parse_iso_date,
+        help="Inclusive validation end date for a fixed chronological split.",
+    )
+    parser.add_argument(
+        "--test-end",
+        type=parse_iso_date,
+        help="Optional inclusive test end date for a fixed chronological split.",
     )
     parser.add_argument("--id-col", default="id_civico")
     parser.add_argument("--date-col", default="data")
@@ -1367,6 +1442,7 @@ def main() -> None:
         args.metrics_output = Path(f"{artifact_stem}_metrics.csv")
 
     con = duckdb.connect()
+    con.execute("SET preserve_insertion_order = false;")
     if args.duckdb_memory_limit:
         con.execute(f"PRAGMA memory_limit={sql_lit(args.duckdb_memory_limit)};")
     if args.duckdb_threads:
@@ -1394,7 +1470,13 @@ def main() -> None:
         limit_rows=args.limit_rows,
     )
 
-    split_counts = create_split_tables(con, args.split_ratios)
+    split_counts = create_split_tables(
+        con,
+        args.split_ratios,
+        train_end=args.train_end,
+        validation_end=args.validation_end,
+        test_end=args.test_end,
+    )
     date_ranges = split_date_ranges(con)
     print("split counts:", json.dumps(split_counts, sort_keys=True))
     print("date ranges:", json.dumps(date_ranges, sort_keys=True))
