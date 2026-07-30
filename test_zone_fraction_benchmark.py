@@ -70,6 +70,118 @@ def test_sarimax_exog_uses_schedule_intervals_and_italian_holidays():
     assert exog.loc[pd.Timestamp("2024-12-27"), "is_after_holiday"] == 1
 
 
+def test_future_model_selection_uses_validation_wape_then_rmse():
+    metrics = pd.DataFrame(
+        [
+            ("sarima", "validation", "vetro", 0.1, 0.2),
+            ("sarimax", "validation", "vetro", 0.1, 0.1),
+            ("seasonal_naive_7d", "validation", "vetro", 0.2, 0.01),
+            ("sarima", "test", "vetro", 0.001, 0.001),
+            ("sarima", "validation", "plastica", 0.3, 0.1),
+            ("sarimax", "validation", "plastica", 0.2, 0.2),
+        ],
+        columns=["model", "split", "frazione", "wape", "rmse"],
+    )
+
+    assert benchmark.select_future_models(metrics) == {
+        "plastica": "sarimax",
+        "vetro": "sarimax",
+    }
+
+
+def test_zone_fraction_future_forecast_is_canonical_and_preserves_group_total(
+    tmp_path,
+):
+    withdrawals = pd.DataFrame(
+        {
+            "scenario_seed": [42, 42, 42],
+            "anno_produzione": [2024, 2024, 2024],
+            "data": pd.to_datetime(["2024-01-01", "2024-01-08", "2024-01-15"]),
+            "zona_raccolta": ["1", "1", "1"],
+            "frazione": ["vetro", "vetro", "vetro"],
+            "cluster_label": [0, 0, 0],
+            "conferimento_t": [3.0, 3.0, 3.0],
+            "giorni_dal_ritiro_precedente": [7, 7, 7],
+        }
+    )
+    withdrawals = benchmark.add_features(withdrawals)
+    civic = pd.DataFrame(
+        {
+            "id_civico": ["a", "b"] * 3,
+            "data": pd.to_datetime(
+                ["2024-01-01", "2024-01-01", "2024-01-08", "2024-01-08",
+                 "2024-01-15", "2024-01-15"]
+            ),
+            "zona_raccolta": ["1"] * 6,
+            "frazione": ["vetro"] * 6,
+            "cluster_label": [0, 1] * 3,
+            "conferimento_t": [1.0, 2.0] * 3,
+            "coord_x": [16.0, 16.1] * 3,
+            "coord_y": [41.0, 41.1] * 3,
+            "densita_locale": [100.0, 110.0] * 3,
+        }
+    )
+    withdrawals_path = tmp_path / "withdrawals.parquet"
+    civic_path = tmp_path / "civic.parquet"
+    con = duckdb.connect()
+    benchmark.write_parquet(con, withdrawals, withdrawals_path)
+    benchmark.write_parquet(con, civic, civic_path)
+    con.close()
+    model_key = "scenario_seed=42|zona_raccolta=1|frazione=vetro"
+    model_path = tmp_path / "model.joblib"
+    joblib.dump(
+        {
+            "model_name": "zone_fraction_sarima",
+            "models": {model_key: {"model": None}},
+            "sarimax_models": {model_key: {"model": None}},
+            "civic_allocator": {
+                "selected_by_fraction": {
+                    "vetro": {"allocator": "historical", "setting": 0.90}
+                },
+                "models": {},
+            },
+        },
+        model_path,
+    )
+    metrics_path = tmp_path / "metrics.csv"
+    pd.DataFrame(
+        [
+            ("baseline_last", "validation", "vetro", 0.01, 0.01),
+            ("seasonal_naive_7d", "validation", "vetro", 0.02, 0.02),
+            ("sarima", "validation", "vetro", 0.03, 0.03),
+        ],
+        columns=["model", "split", "frazione", "wape", "rmse"],
+    ).to_csv(metrics_path, index=False)
+    calendar_path = tmp_path / "calendar.csv"
+    calendar_path.write_text(
+        "zona_raccolta,frazione,weekday,raccolta\n"
+        "1,vetro,lunedi,1\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "future.parquet"
+
+    benchmark.forecast_arima_benchmark(
+        withdrawals_path,
+        civic_path,
+        model_path,
+        metrics_path,
+        model_path,
+        metrics_path,
+        calendar_path,
+        output,
+        date(2024, 1, 22),
+        date(2024, 1, 22),
+    )
+
+    result = duckdb.connect().execute(
+        "SELECT * FROM read_parquet(?) ORDER BY id_civico", [str(output)]
+    ).df()
+    assert result["prediction_t"].tolist() == pytest.approx([1.0, 2.0])
+    assert result["prediction_t"].sum() == pytest.approx(3.0)
+    assert set(result["model"]) == {"baseline_last"}
+    assert set(result["pipeline"]) == {"zone-fraction"}
+
+
 def test_non_finite_arima_forecasts_use_the_seasonal_naive_fallback():
     predicted, methods = benchmark.apply_forecast_fallback(
         np.array([1.0, np.nan, np.inf]),
@@ -531,6 +643,36 @@ def test_prepare_validates_and_builds_zero_withdrawals(tmp_path):
     assert manifest["validation"]["total_t"] == 3.0
 
 
+def test_prepare_can_skip_production_validation(tmp_path):
+    annual, _, collections, calendar = complete_fixture(tmp_path)
+    annual_frame = duckdb.connect().execute(
+        "SELECT * EXCLUDE (prg_error, zona_raccolta_inferita, "
+        "zona_costruzione_riassegnata, "
+        "distanza_inferenza_zona_raccolta_gradi, "
+        "distanza_riassegnazione_prg) FROM read_parquet(?)",
+        [str(annual)],
+    ).df()
+    write_parquet(annual, annual_frame)
+
+    outputs = benchmark.prepare_complete_dataset(
+        annual_path=annual,
+        production_path=None,
+        collections_path=collections,
+        calendar_path=calendar,
+        output_dir=tmp_path / "output",
+        year=2024,
+        annual_seed=42,
+        scenario_seed=42,
+        spillover_days=0,
+        missing_calendar_mode="error",
+        generator_version="collections-only-fixture",
+    )
+
+    manifest = json.loads(outputs.manifest.read_text(encoding="utf-8"))
+    assert "production" not in manifest["inputs"]
+    assert manifest["validation"]["total_t"] == 3.0
+
+
 def test_prepare_rejects_unknown_fraction(tmp_path):
     annual, production, collections, calendar = complete_fixture(tmp_path)
     con = duckdb.connect()
@@ -766,6 +908,7 @@ def test_complete_parquet_graph_is_separate_from_legacy(tmp_path):
         "prepare_zone_fraction",
         "train_zone_fraction",
         "train_zone_fraction_arima",
+        "finalize_run",
     ]
     assert graph["classify_collections"].needs == ("kmeans",)
     assert graph["prepare_zone_fraction"].needs == ("classify_collections",)
@@ -803,4 +946,5 @@ def test_complete_parquet_graph_is_separate_from_legacy(tmp_path):
         "kmeans",
         "daily_distribution",
         "grouped_sgd",
+        "finalize_run",
     ]

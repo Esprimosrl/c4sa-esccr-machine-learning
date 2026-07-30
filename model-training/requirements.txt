@@ -1,0 +1,10 @@
+duckdb==1.5.3
+fastapi==0.139.0
+joblib==1.5.3
+numpy==2.4.6
+pandas==3.0.3
+polars==1.41.2
+scikit-learn==1.9.0
+statsmodels==0.14.6
+tqdm==4.68.2
+uvicorn==0.51.0

@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY onnx_inference/app.py .
 COPY quantumleap.py .
 COPY inference_data.py orion.py lag_features.py .
+COPY model-training/zone_fraction_benchmark.py .
 COPY data_csv_parquet/calendario_raccolta.csv .
 
 USER app

@@ -7,10 +7,13 @@ from pathlib import Path
 import json
 import math
 import os
+import sys
 import time
 
+import joblib
 import numpy as np
 import onnxruntime as ort
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError
 
@@ -23,6 +26,16 @@ from quantumleap import (
 from inference_data import DAILY_ATTRS, annual_rows, attribute, forecast_events, latest_annual, split_years, twin_id
 from orion import OrionError, OrionTimeout, publish_entities
 from lag_features import LAG_FEATURES, LagState
+
+TRAINING_DIR = Path(__file__).resolve().parents[1] / "model-training"
+if TRAINING_DIR.is_dir():
+    sys.path.insert(0, str(TRAINING_DIR))
+
+from zone_fraction_benchmark import (
+    daily_sarimax_exog,
+    forecast_schedule,
+    sarima_forecast,
+)
 
 
 SUPPORTED_FEATURES = {
@@ -95,6 +108,53 @@ class QuantumLeapForecastRequest(BaseModel):
     civic_ids: list[str] | None = Field(default=None, min_length=1)
 
 
+class ZoneFractionPredictionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    giorni_dal_ritiro_precedente: FiniteFloat | None = None
+    month: FiniteFloat | None = None
+    day_of_week: FiniteFloat | None = None
+    week_of_year: FiniteFloat | None = None
+    day_of_year_sin: FiniteFloat | None = None
+    day_of_year_cos: FiniteFloat | None = None
+    day_of_week_sin: FiniteFloat | None = None
+    day_of_week_cos: FiniteFloat | None = None
+    is_holiday: FiniteFloat | None = None
+    is_after_holiday: FiniteFloat | None = None
+    is_summer: FiniteFloat | None = None
+    is_christmas_period: FiniteFloat | None = None
+    lag_1_collection_t: FiniteFloat | None = None
+    lag_7d_collection_t: FiniteFloat | None = None
+    rolling_4_collection_mean_t: FiniteFloat | None = None
+    rolling_4_collection_median_t: FiniteFloat | None = None
+    rolling_7d_mean_t: FiniteFloat | None = None
+    rolling_7d_sum_t: FiniteFloat | None = None
+    rolling_7d_count: FiniteFloat | None = None
+    lag_1_missing: FiniteFloat | None = None
+    lag_7d_missing: FiniteFloat | None = None
+    rolling_4_missing: FiniteFloat | None = None
+    rolling_7d_missing: FiniteFloat | None = None
+    zona_raccolta: str = Field(min_length=1)
+    frazione: str = Field(min_length=1)
+    cluster_label: int
+
+
+class ZoneFractionPredictionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    instances: list[ZoneFractionPredictionInput] = Field(min_length=1)
+
+
+class ZoneFractionForecastRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    forecast_from_date: date
+    forecast_to_date: date
+    zones: list[str] | None = Field(default=None, min_length=1)
+    fractions: list[str] | None = Field(default=None, min_length=1)
+    cluster_labels: list[int] | None = Field(default=None, min_length=1)
+
+
 QUANTUMLEAP_FEATURES = [
     "id_civico",
     "frazione",
@@ -157,6 +217,8 @@ def feature_values(instance: PredictionInput) -> dict[str, float]:
 
 
 class ModelPackage:
+    task = "grouped_regression"
+
     def __init__(
         self,
         model_version: str,
@@ -273,10 +335,273 @@ class ModelPackage:
         return predictions
 
 
+class ZoneFractionPackage:
+    task = "zone_fraction_regression"
+
+    def __init__(
+        self,
+        model_version: str,
+        tabular_version: str,
+        sarimax_version: str,
+        inputs: list[dict[str, str]],
+        input_names: set[str],
+        preprocessor: object | None,
+        transformed_feature_count: int | None,
+        input_name: str | None,
+        output_name: str,
+        session: ort.InferenceSession,
+        sarimax_models: dict[str, dict[str, object]],
+    ):
+        self.model_version = model_version
+        self.tabular_version = tabular_version
+        self.sarimax_version = sarimax_version
+        self.inputs = inputs
+        self.input_names = input_names
+        self.preprocessor = preprocessor
+        self.transformed_feature_count = transformed_feature_count
+        self.input_name = input_name
+        self.output_name = output_name
+        self.session = session
+        self.sarimax_models = sarimax_models
+
+    @property
+    def group_count(self) -> int:
+        return len(self.sarimax_models)
+
+    @classmethod
+    def load(cls, model_dir: Path, manifest: dict[str, object]) -> ZoneFractionPackage:
+        root = model_dir.resolve()
+        tabular = manifest["tabular"]
+        sarimax = manifest["sarimax"]
+        tabular_path = (root / tabular["model"]).resolve()
+        sarimax_path = (root / sarimax["model"]).resolve()
+        preprocessor_path = (
+            (root / tabular["preprocessor"]).resolve()
+            if tabular.get("preprocessor")
+            else None
+        )
+        if (
+            not tabular_path.is_relative_to(root)
+            or not sarimax_path.is_relative_to(root)
+            or (
+                preprocessor_path is not None
+                and not preprocessor_path.is_relative_to(root)
+            )
+        ):
+            raise ValueError("Model path escapes the package directory.")
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session = ort.InferenceSession(
+            tabular_path,
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        inputs = list(tabular["inputs"])
+        input_names = {str(item["name"]) for item in inputs}
+        preprocessor = None
+        transformed_feature_count = None
+        input_name = None
+        if preprocessor_path is not None:
+            preprocessor = joblib.load(preprocessor_path)
+            transformed_feature_count = int(tabular["transformed_feature_count"])
+            session_inputs = session.get_inputs()
+            if (
+                len(session_inputs) != 1
+                or session_inputs[0].type != "tensor(float)"
+                or len(session_inputs[0].shape) != 2
+                or session_inputs[0].shape[1] != transformed_feature_count
+            ):
+                raise ValueError(
+                    "Zone/fraction ONNX transformed input does not match "
+                    "the manifest."
+                )
+            input_name = session_inputs[0].name
+        elif input_names != {item.name for item in session.get_inputs()}:
+            raise ValueError("Zone/fraction ONNX inputs do not match the manifest.")
+        output_name = str(tabular["output"]["name"])
+        if [item.name for item in session.get_outputs()] != [output_name]:
+            raise ValueError("Zone/fraction ONNX output does not match the manifest.")
+
+        native_bundle = joblib.load(sarimax_path)
+        if (
+            native_bundle.get("contract")
+            != "zone-fraction-scheduled-withdrawal-v1"
+            or native_bundle.get("model_name") != "zone_fraction_sarima"
+        ):
+            raise ValueError("Unsupported native zone/fraction SARIMAX bundle.")
+        sarimax_models = native_bundle["sarimax_models"]
+        if len(sarimax_models) != int(sarimax["group_count"]):
+            raise ValueError("SARIMAX group count does not match the manifest.")
+        return cls(
+            str(manifest["model_version"]),
+            str(tabular["version"]),
+            str(sarimax["version"]),
+            inputs,
+            input_names,
+            preprocessor,
+            transformed_feature_count,
+            input_name,
+            output_name,
+            session,
+            sarimax_models,
+        )
+
+    def predict(self, instances: list[ZoneFractionPredictionInput]) -> list[float]:
+        rows = [instance.model_dump() for instance in instances]
+        if self.preprocessor is not None:
+            matrix = np.asarray(
+                self.preprocessor.transform(pd.DataFrame(rows)),
+                dtype=np.float32,
+            )
+            if (
+                matrix.ndim != 2
+                or matrix.shape[1] != self.transformed_feature_count
+            ):
+                raise RuntimeError(
+                    "Zone/fraction preprocessor produced an unexpected shape."
+                )
+            feed = {self.input_name: matrix}
+        else:
+            feed = {}
+            for spec in self.inputs:
+                name = str(spec["name"])
+                dtype = str(spec["dtype"])
+                values = [row[name] for row in rows]
+                if dtype in {"float32", "float64"}:
+                    array = np.asarray(
+                        [np.nan if value is None else value for value in values],
+                        dtype=np.float32 if dtype == "float32" else np.float64,
+                    )
+                elif dtype == "int64":
+                    array = np.asarray(values, dtype=np.int64)
+                elif dtype == "string":
+                    array = np.asarray(values, dtype=object)
+                else:
+                    raise ValueError(f"Unsupported model input dtype: {dtype}")
+                feed[name] = array.reshape(-1, 1)
+        output = self.session.run([self.output_name], feed)[0].reshape(-1)
+        if len(output) != len(instances) or not np.isfinite(output).all():
+            raise RuntimeError("Invalid zone/fraction inference output.")
+        return output.astype(float).tolist()
+
+    @staticmethod
+    def _group_values(model_key: str) -> dict[str, str]:
+        try:
+            return dict(part.split("=", 1) for part in model_key.split("|"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid SARIMAX model key: {model_key}") from exc
+
+    def forecast(
+        self,
+        payload: ZoneFractionForecastRequest,
+        calendar_path: Path,
+    ) -> list[dict[str, object]]:
+        if payload.forecast_from_date > payload.forecast_to_date:
+            raise ValueError("forecast_from_date must not be after forecast_to_date")
+
+        entries = [
+            (self._group_values(model_key), info)
+            for model_key, info in self.sarimax_models.items()
+        ]
+        zones = sorted({values["zona_raccolta"] for values, _ in entries})
+        fractions = sorted({values["frazione"] for values, _ in entries})
+        schedule_start = min(
+            (
+                pd.Timestamp(info["model"].model.data.dates[-1]).date()
+                + pd.Timedelta(days=1)
+            )
+            for _, info in entries
+        )
+        if payload.forecast_from_date < schedule_start:
+            raise ValueError(
+                f"forecast dates must begin on or after {schedule_start.isoformat()}"
+            )
+        schedule = forecast_schedule(
+            calendar_path,
+            zones,
+            fractions,
+            schedule_start,
+            payload.forecast_to_date,
+        )
+
+        selected_zones = set(payload.zones or zones)
+        selected_fractions = set(payload.fractions or fractions)
+        selected_clusters = (
+            set(payload.cluster_labels) if payload.cluster_labels is not None else None
+        )
+        rows = []
+        for values, info in entries:
+            zone = values["zona_raccolta"]
+            fraction = values["frazione"]
+            cluster_label = (
+                int(values["cluster_label"])
+                if "cluster_label" in values
+                else None
+            )
+            if zone not in selected_zones or fraction not in selected_fractions:
+                continue
+            if (
+                selected_clusters is not None
+                and cluster_label not in selected_clusters
+            ):
+                continue
+            group_schedule = schedule[
+                (schedule["zona_raccolta"] == zone)
+                & (schedule["frazione"] == fraction)
+            ].sort_values("data")
+            if group_schedule.empty:
+                continue
+            index = pd.date_range(
+                schedule_start, payload.forecast_to_date, freq="D"
+            )
+            exog = daily_sarimax_exog(
+                group_schedule,
+                schedule_start,
+                payload.forecast_to_date,
+            ).reindex(index)
+            predictions = sarima_forecast(
+                info["model"],
+                schedule_start,
+                payload.forecast_to_date,
+                exog,
+            )
+            for event_date in pd.to_datetime(group_schedule["data"]).dt.date:
+                if event_date < payload.forecast_from_date:
+                    continue
+                value = float(predictions.loc[pd.Timestamp(event_date)])
+                if not np.isfinite(value):
+                    raise RuntimeError(
+                        f"SARIMAX produced an invalid forecast for {values}."
+                    )
+                rows.append(
+                    {
+                        "scenario_seed": int(values["scenario_seed"]),
+                        "data": event_date.isoformat(),
+                        "zona_raccolta": zone,
+                        "frazione": fraction,
+                        "cluster_label": cluster_label,
+                        "prediction_t": value,
+                    }
+                )
+        return rows
+
+
+def load_model_package(model_dir: Path) -> ModelPackage | ZoneFractionPackage:
+    manifest = json.loads(
+        (model_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    if manifest.get("task") == "zone_fraction_regression":
+        return ZoneFractionPackage.load(model_dir, manifest)
+    return ModelPackage.load(model_dir)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model_dir = Path(os.environ.get("MODEL_DIR", "/models"))
-    app.state.model_package = ModelPackage.load(model_dir)
+    app.state.model_package = load_model_package(model_dir)
     ql_url = os.environ.get("QL_URL", "http://localhost:8668")
     service = os.environ.get("FIWARE_SERVICE", "openiot")
     service_path = os.environ.get("FIWARE_SERVICE_PATH", "/")
@@ -304,7 +629,27 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="ONNX grouped regressor", version="1", lifespan=lifespan)
+app = FastAPI(title="Waste regression runtime", version="1", lifespan=lifespan)
+
+
+def legacy_package(request: Request) -> ModelPackage:
+    package = request.app.state.model_package
+    if not isinstance(package, ModelPackage):
+        raise HTTPException(
+            status_code=409,
+            detail="This endpoint requires a legacy grouped-regression package.",
+        )
+    return package
+
+
+def zone_fraction_package(request: Request) -> ZoneFractionPackage:
+    package = request.app.state.model_package
+    if not isinstance(package, ZoneFractionPackage):
+        raise HTTPException(
+            status_code=409,
+            detail="This endpoint requires a zone/fraction package.",
+        )
+    return package
 
 
 @app.get("/healthz")
@@ -317,8 +662,13 @@ def ready(request: Request) -> dict[str, str | int]:
     package = request.app.state.model_package
     return {
         "status": "ready",
+        "task": package.task,
         "model_version": package.model_version,
-        "group_count": len(package.sessions),
+        "group_count": (
+            len(package.sessions)
+            if isinstance(package, ModelPackage)
+            else package.group_count
+        ),
     }
 
 
@@ -326,7 +676,7 @@ def ready(request: Request) -> dict[str, str | int]:
 def predict(
     payload: PredictionRequest, request: Request
 ) -> dict[str, str | list[dict[str, float]]]:
-    package = request.app.state.model_package
+    package = legacy_package(request)
     try:
         values = package.predict(payload.instances)
     except UnknownGroup as exc:
@@ -340,9 +690,36 @@ def predict(
     }
 
 
+@app.post("/v1/predict/zone-fraction")
+def predict_zone_fraction(
+    payload: ZoneFractionPredictionRequest, request: Request
+) -> dict[str, str | list[dict[str, float]]]:
+    package = zone_fraction_package(request)
+    values = package.predict(payload.instances)
+    return {
+        "model_version": package.tabular_version,
+        "predictions": [{"prediction_t": value} for value in values],
+    }
+
+
+@app.post("/v1/forecast/zone-fraction")
+def forecast_zone_fraction(
+    payload: ZoneFractionForecastRequest, request: Request
+) -> dict[str, str | list[dict[str, object]]]:
+    package = zone_fraction_package(request)
+    try:
+        rows = package.forecast(payload, request.app.state.forecast["calendar"])
+    except (FileNotFoundError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "model_version": package.sarimax_version,
+        "predictions": rows,
+    }
+
+
 @app.post("/v1/predict/quantumleap")
 def predict_quantumleap(payload: QuantumLeapPredictionRequest, request: Request):
-    package = request.app.state.model_package
+    package = legacy_package(request)
     try:
         rows = request.app.state.quantumleap.fetch(
             QUANTUMLEAP_FEATURES,
@@ -432,6 +809,7 @@ LABEL_FEATURES = [
 
 @app.post("/v1/forecast/quantumleap")
 def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
+    package = legacy_package(request)
     if payload.forecast_from_date > payload.forecast_to_date:
         raise HTTPException(status_code=422, detail="Invalid forecast date range.")
     try:
@@ -482,7 +860,7 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
     if missing:
         raise HTTPException(status_code=404, detail=f"Missing digital-twin labels: {', '.join(missing)}")
 
-    model_fractions = sorted({fraction for fraction, _ in request.app.state.model_package.sessions})
+    model_fractions = sorted({fraction for fraction, _ in package.sessions})
     events = forecast_events(
         config["calendar"],
         [row["zona_raccolta"] for row, _, _, _ in targets],
@@ -497,7 +875,7 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
         for event in events:
             if event["zona_raccolta"] != str(row["zona_raccolta"]) or event["data"].year != year:
                 continue
-            if (event["frazione"], label) not in request.app.state.model_package.sessions:
+            if (event["frazione"], label) not in package.sessions:
                 continue
             forecast_rows[event["data"]].append((entity_id, row, event, label))
     lag_state = LagState()
@@ -537,7 +915,7 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
                     cluster_label=label,
                     **lag_values,
                 ))
-            values = request.app.state.model_package.predict(instances)
+            values = package.predict(instances)
             for (entity_id, row, event, _), value in zip(
                 descriptors, values, strict=True
             ):
@@ -567,7 +945,7 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
             "cluster_label": attribute(int(label["cluster_label"]), "Integer"),
             "cluster_distance": attribute(float(label["cluster_distance"]), "Number"),
             "classifier_model_version": attribute(str(label["classifier_model_version"]), "Text"),
-            "regressor_model_version": attribute(request.app.state.model_package.model_version, "Text"),
+            "regressor_model_version": attribute(package.model_version, "Text"),
             "forecast_from": attribute(f"{year_start.isoformat()}T00:00:00Z", "DateTime"),
             "forecast_to": attribute(f"{year_end.isoformat()}T23:59:59Z", "DateTime"),
             "dateObserved": attribute(observed, "DateTime"),
@@ -594,4 +972,4 @@ def forecast_quantumleap(payload: QuantumLeapForecastRequest, request: Request):
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except OrionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"model_version": request.app.state.model_package.model_version, "predictions": predictions}
+    return {"model_version": package.model_version, "predictions": predictions}

@@ -172,6 +172,177 @@ def regression_command(
     ]
 
 
+def append_orion_publication(
+    graph: dict[str, Node],
+    *,
+    python: str,
+    dependency: str,
+    output_dir: Path | None,
+    assignments: Path,
+    classifier_model: Path,
+    regressor_model: Path,
+    forecast_from_date: str,
+    forecast_to_date: str,
+    orion_url: str,
+    orion_entity_type: str,
+    orion_timeout_seconds: float,
+    orion_batch_size: int,
+    fiware_service: str,
+    fiware_service_path: str,
+    predictions: Path | None = None,
+    history: Path | None = None,
+    calendar: Path | None = None,
+    training_to_date: str | None = None,
+    pipeline_name: str = "legacy",
+    publish: bool = True,
+) -> None:
+    stage = artifact(output_dir, "predictions/digital_twins.jsonl")
+    future = predictions or artifact(output_dir, "predictions/future.parquet")
+    command = [
+        python,
+        "model-training/publish_digital_twins.py",
+        "--assignments",
+        str(assignments),
+        "--classifier-model",
+        str(classifier_model),
+        "--regressor-model",
+        str(regressor_model),
+        "--forecast-from-date",
+        forecast_from_date,
+        "--forecast-to-date",
+        forecast_to_date,
+        "--stage-output",
+        str(stage),
+        "--orion-url",
+        orion_url,
+        "--orion-entity-type",
+        orion_entity_type,
+        "--orion-timeout-seconds",
+        str(orion_timeout_seconds),
+        "--orion-batch-size",
+        str(orion_batch_size),
+        "--fiware-service",
+        fiware_service,
+        "--fiware-service-path",
+        fiware_service_path,
+        "--stage-only",
+    ]
+    stage_inputs = [assignments, classifier_model, regressor_model]
+    if predictions:
+        command += ["--predictions", str(predictions)]
+        stage_inputs.append(predictions)
+    else:
+        command += [
+            "--history",
+            str(history),
+            "--calendar",
+            str(calendar),
+            "--training-to-date",
+            str(training_to_date),
+            "--predictions-output",
+            str(future),
+            "--pipeline",
+            pipeline_name,
+        ]
+        stage_inputs.extend([history, calendar])
+    graph["stage_digital_twins"] = Node(
+        "stage_digital_twins",
+        command,
+        tuple(stage_inputs),
+        (stage,) if predictions else (stage, future),
+        (dependency,),
+    )
+    if publish:
+        graph["publish_digital_twins"] = Node(
+            "publish_digital_twins",
+            [
+                python,
+                "model-training/publish_digital_twins.py",
+                "--publish-stage",
+                str(stage),
+                "--orion-url",
+                orion_url,
+                "--orion-entity-type",
+                orion_entity_type,
+                "--orion-timeout-seconds",
+                str(orion_timeout_seconds),
+                "--orion-batch-size",
+                str(orion_batch_size),
+                "--fiware-service",
+                fiware_service,
+                "--fiware-service-path",
+                fiware_service_path,
+            ],
+            (stage,),
+            (),
+            ("stage_digital_twins",),
+        )
+
+
+def append_run_finalizer(
+    graph: dict[str, Node],
+    *,
+    python: str,
+    pipeline_name: str,
+    source: str,
+    output_dir: Path | None,
+    model_name: str,
+    test_input: Path,
+    model_paths: tuple[Path, ...],
+    metrics_paths: tuple[Path, ...],
+    needs: tuple[str, ...],
+    input_paths: tuple[Path, ...] = (),
+    future_path: Path | None = None,
+    future_input: Path | None = None,
+) -> None:
+    test_output = artifact(output_dir, "predictions/test.parquet")
+    manifest = artifact(output_dir, "run_manifest.json")
+    command = [
+        python,
+        "model-training/finalize_run.py",
+        "--pipeline",
+        pipeline_name,
+        "--source",
+        source,
+        "--model-name",
+        model_name,
+        "--test-input",
+        str(test_input),
+        "--test-output",
+        str(test_output),
+        "--manifest-output",
+        str(manifest),
+    ]
+    for path in model_paths:
+        command += ["--model-path", str(path)]
+    for path in metrics_paths:
+        command += ["--metrics-path", str(path)]
+    for path in input_paths:
+        command += ["--input-path", str(path)]
+    inputs = [test_input, *model_paths, *metrics_paths, *input_paths]
+    outputs = [test_output, manifest]
+    if future_path:
+        command += ["--future-path", str(future_path)]
+        inputs.append(future_path)
+    elif future_input:
+        canonical_future = artifact(output_dir, "predictions/future.parquet")
+        command += [
+            "--future-input",
+            str(future_input),
+            "--future-output",
+            str(canonical_future),
+        ]
+        inputs.append(future_input)
+        outputs.append(canonical_future)
+    graph["finalize_run"] = Node(
+        "finalize_run",
+        command,
+        tuple(inputs),
+        tuple(outputs),
+        needs,
+    )
+
+
 def normalize_training_range(from_date: str, to_date: str) -> tuple[str, str]:
     def normalize(value: str, end: bool) -> str:
         try:
@@ -209,6 +380,7 @@ def build_graph(
     forecast_calendar: Path | None = None,
     arima_group_level: bool = False,
     arima_group_by: str = "cluster",
+    source: str = "file",
 ) -> dict[str, Node]:
     annual_input = local_path(
         annual_input,
@@ -335,6 +507,24 @@ def build_graph(
             needs=("daily_distribution",),
         ),
     }
+    append_run_finalizer(
+        graph,
+        python=python,
+        pipeline_name="legacy",
+        source=source,
+        output_dir=output_dir,
+        model_name=regressor,
+        test_input=predictions,
+        model_paths=(regressor_model, classifier_model),
+        metrics_paths=(metrics,),
+        needs=(regression_node,),
+        input_paths=(annual_input, calendar_input),
+        future_input=(
+            future_predictions
+            if regressor == "arima" and future_predictions is not None
+            else None
+        ),
+    )
     return graph
 
 
@@ -344,7 +534,7 @@ def build_complete_parquet_graph(
     year: str,
     output_dir: Path,
     annual_input: Path,
-    production_input: Path,
+    production_input: Path | None,
     collections_input: Path,
     calendar_input: Path,
     annual_seed: int = 42,
@@ -357,10 +547,16 @@ def build_complete_parquet_graph(
     include_arima: bool = False,
     validation_strategy: str = "fixed",
     validation_folds: int = 5,
+    initial_needs: tuple[str, ...] = (),
+    forecast_from_date: str | None = None,
+    forecast_to_date: str | None = None,
+    forecast_calendar: Path | None = None,
+    source: str = "file",
 ) -> dict[str, Node]:
     output_dir = local_path(output_dir, str(output_dir))
     annual_input = local_path(annual_input, str(annual_input))
-    production_input = local_path(production_input, str(production_input))
+    if production_input is not None:
+        production_input = local_path(production_input, str(production_input))
     collections_input = local_path(collections_input, str(collections_input))
     calendar_input = local_path(calendar_input, str(calendar_input))
     assignments = output_dir / "data" / "kmeans_assignments.parquet"
@@ -401,6 +597,7 @@ def build_complete_parquet_graph(
         output_dir / "metrics" / "zone_fraction_arima_allocator_benchmark.csv"
     )
     script = "model-training/zone_fraction_benchmark.py"
+    include_arima = include_arima or bool(forecast_from_date)
     graph = {
         "kmeans": Node(
             name="kmeans",
@@ -430,6 +627,7 @@ def build_complete_parquet_graph(
             ],
             inputs=(annual_input,),
             outputs=(assignments, classifier_model),
+            needs=initial_needs,
         ),
         "classify_collections": Node(
             name="classify_collections",
@@ -456,8 +654,11 @@ def build_complete_parquet_graph(
                 "prepare",
                 "--annual-input",
                 str(annual_input),
-                "--production-input",
-                str(production_input),
+                *(
+                    ["--production-input", str(production_input)]
+                    if production_input is not None
+                    else []
+                ),
                 "--collections-input",
                 str(classified_collections),
                 "--calendar-input",
@@ -479,7 +680,7 @@ def build_complete_parquet_graph(
             ],
             inputs=(
                 annual_input,
-                production_input,
+                *((production_input,) if production_input is not None else ()),
                 classified_collections,
                 calendar_input,
             ),
@@ -548,6 +749,210 @@ def build_complete_parquet_graph(
                 arima_allocator_metrics,
             ),
             needs=("prepare_zone_fraction",),
+        )
+    if forecast_from_date:
+        future_predictions = output_dir / "predictions" / "future.parquet"
+        selected_calendar = local_path(
+            forecast_calendar, str(calendar_input)
+        )
+        graph["forecast_zone_fraction"] = Node(
+            name="forecast_zone_fraction",
+            command=[
+                python,
+                script,
+                "forecast",
+                "--input",
+                str(withdrawals),
+                "--civic-input",
+                str(classified_collections),
+                "--model",
+                str(arima_model),
+                "--metrics",
+                str(arima_metrics),
+                "--tabular-model",
+                str(model),
+                "--tabular-metrics",
+                str(metrics),
+                "--calendar",
+                str(selected_calendar),
+                "--output",
+                str(future_predictions),
+                "--forecast-from-date",
+                forecast_from_date,
+                "--forecast-to-date",
+                str(forecast_to_date),
+            ],
+            inputs=(
+                withdrawals,
+                classified_collections,
+                arima_model,
+                arima_metrics,
+                model,
+                metrics,
+                selected_calendar,
+            ),
+            outputs=(future_predictions,),
+            needs=("train_zone_fraction_arima",),
+        )
+    finalizer_needs = ["train_zone_fraction"]
+    model_paths = [model, classifier_model]
+    metrics_paths = [metrics]
+    test_input = predictions
+    model_name = "validation-selected-tabular"
+    if include_arima:
+        finalizer_needs.append("train_zone_fraction_arima")
+        model_paths.append(arima_model)
+        metrics_paths.append(arima_metrics)
+        test_input = arima_civic_predictions
+        model_name = "validation-selected-arima"
+    future_predictions = (
+        output_dir / "predictions" / "future.parquet"
+        if forecast_from_date
+        else None
+    )
+    if future_predictions:
+        finalizer_needs.append("forecast_zone_fraction")
+    append_run_finalizer(
+        graph,
+        python=python,
+        pipeline_name="zone-fraction",
+        source=source,
+        output_dir=output_dir,
+        model_name=model_name,
+        test_input=test_input,
+        model_paths=tuple(model_paths),
+        metrics_paths=tuple(metrics_paths),
+        needs=tuple(finalizer_needs),
+        input_paths=(
+            annual_input,
+            *((production_input,) if production_input is not None else ()),
+            collections_input,
+            calendar_input,
+        ),
+        future_path=future_predictions,
+    )
+    return graph
+
+
+def build_zone_fraction_quantumleap_graph(
+    python: str,
+    model_seed: str,
+    year: str,
+    output_dir: Path,
+    calendar_input: Path,
+    args: argparse.Namespace,
+) -> dict[str, Node]:
+    output_dir = local_path(output_dir, str(output_dir))
+    inputs_dir = output_dir / "inputs"
+    daily = inputs_dir / "quantumleap_daily.parquet"
+    annual = inputs_dir / "annual.parquet"
+    production = inputs_dir / "production.parquet"
+    collections = inputs_dir / "collections.parquet"
+    collections_only = getattr(args, "ql_collections_only", False)
+    fetch_command = [
+        python,
+        "model-training/prepare_quantumleap.py",
+        "fetch",
+        "--profile",
+        "legacy" if collections_only else "complete",
+        "--output",
+        str(daily),
+        "--from-date",
+        args.from_date,
+        "--to-date",
+        args.to_date,
+        "--ql-url",
+        args.ql_url,
+        "--ql-entity-type",
+        args.ql_entity_type,
+        "--fiware-service",
+        args.fiware_service,
+        "--fiware-service-path",
+        args.fiware_service_path,
+        "--ql-timeout-seconds",
+        str(args.ql_timeout_seconds),
+    ]
+    if args.ql_id_pattern:
+        fetch_command += ["--ql-id-pattern", args.ql_id_pattern]
+
+    snapshot_command = [
+        python,
+        "model-training/prepare_quantumleap.py",
+        "snapshot-collections" if collections_only else "snapshot",
+        "--input",
+        str(daily),
+        "--annual-output",
+        str(annual),
+        "--collections-output",
+        str(collections),
+    ]
+    snapshot_outputs = (annual, collections)
+    if not collections_only:
+        snapshot_command += ["--production-output", str(production)]
+        snapshot_outputs = (annual, production, collections)
+
+    graph = {
+        "quantumleap_fetch": Node(
+            "quantumleap_fetch", fetch_command, (), (daily,)
+        ),
+        "quantumleap_snapshot": Node(
+            "quantumleap_snapshot",
+            snapshot_command,
+            (daily,),
+            snapshot_outputs,
+            ("quantumleap_fetch",),
+        ),
+    }
+    graph.update(
+        build_complete_parquet_graph(
+            python,
+            model_seed,
+            year,
+            output_dir,
+            annual,
+            None if collections_only else production,
+            collections,
+            calendar_input,
+            getattr(args, "annual_seed", 42),
+            getattr(args, "scenario_seed", 42),
+            getattr(args, "spillover_days", 14),
+            getattr(args, "missing_calendar_mode", "error"),
+            getattr(args, "generator_version", "quantumleap"),
+            getattr(args, "exclude_episodic_fractions", False),
+            getattr(args, "hgb_loss", "poisson"),
+            getattr(args, "include_arima", False),
+            getattr(args, "validation_strategy", "fixed"),
+            getattr(args, "validation_folds", 5),
+            ("quantumleap_snapshot",),
+            getattr(args, "forecast_from_date", None),
+            getattr(args, "forecast_to_date", None),
+            (
+                Path(args.forecast_calendar)
+                if getattr(args, "forecast_calendar", None)
+                else calendar_input
+            ),
+            "quantumleap",
+        )
+    )
+    if getattr(args, "publish_orion", False):
+        append_orion_publication(
+            graph,
+            python=python,
+            dependency="finalize_run",
+            output_dir=output_dir,
+            assignments=output_dir / "data" / "kmeans_assignments.parquet",
+            classifier_model=output_dir / "models" / "kmeans_model.joblib",
+            regressor_model=output_dir / "models" / "zone_fraction_arima.joblib",
+            predictions=output_dir / "predictions" / "future.parquet",
+            forecast_from_date=args.forecast_from_date,
+            forecast_to_date=args.forecast_to_date,
+            orion_url=args.orion_url,
+            orion_entity_type=args.orion_entity_type,
+            orion_timeout_seconds=args.orion_timeout_seconds,
+            orion_batch_size=args.orion_batch_size,
+            fiware_service=args.fiware_service,
+            fiware_service_path=args.fiware_service_path,
+            pipeline_name="zone-fraction",
         )
     return graph
 
@@ -706,56 +1111,215 @@ def build_quantumleap_graph(
             ("cluster_join",),
         ),
     }
-    if getattr(args, "publish_orion", False):
+    if forecast_from_date and regressor != "arima":
         calendar = Path(args.forecast_calendar)
         if not calendar.is_absolute():
             calendar = rel(args.forecast_calendar)
-        stage = temp_dir / "digital_twins.jsonl"
+        append_orion_publication(
+            graph,
+            python=python,
+            dependency=regression_node,
+            output_dir=output_dir,
+            assignments=assignments,
+            classifier_model=classifier_model,
+            regressor_model=regressor_model,
+            forecast_from_date=args.forecast_from_date,
+            forecast_to_date=args.forecast_to_date,
+            orion_url=args.orion_url,
+            orion_entity_type=args.orion_entity_type,
+            orion_timeout_seconds=args.orion_timeout_seconds,
+            orion_batch_size=args.orion_batch_size,
+            fiware_service=args.fiware_service,
+            fiware_service_path=args.fiware_service_path,
+            history=classified,
+            calendar=calendar,
+            training_to_date=args.to_date,
+            publish=getattr(args, "publish_orion", False),
+        )
+    canonical_future = (
+        artifact(output_dir, "predictions/future.parquet")
+        if forecast_from_date and regressor != "arima"
+        else None
+    )
+    append_run_finalizer(
+        graph,
+        python=python,
+        pipeline_name="legacy",
+        source="quantumleap",
+        output_dir=output_dir,
+        model_name=regressor,
+        test_input=predictions,
+        model_paths=(regressor_model, classifier_model),
+        metrics_paths=(metrics,),
+        needs=(
+            ("stage_digital_twins",)
+            if "stage_digital_twins" in graph
+            else (regression_node,)
+        ),
+        input_paths=(daily,),
+        future_path=canonical_future,
+        future_input=(
+            future_predictions
+            if regressor == "arima" and future_predictions is not None
+            else None
+        ),
+    )
+    if "publish_digital_twins" in graph:
+        publish = graph.pop("publish_digital_twins")
         graph["publish_digital_twins"] = Node(
-            "publish_digital_twins",
-            [
-                python,
-                "model-training/publish_digital_twins.py",
-                "--assignments",
-                str(assignments),
-                "--classifier-model",
-                str(classifier_model),
-                "--regressor-model",
-                str(regressor_model),
-                "--history",
-                str(classified),
-                "--calendar",
-                str(calendar),
-                "--forecast-from-date",
-                args.forecast_from_date,
-                "--forecast-to-date",
-                args.forecast_to_date,
-                "--training-to-date",
-                args.to_date,
-                "--stage-output",
-                str(stage),
-                "--orion-url",
-                args.orion_url,
-                "--orion-entity-type",
-                args.orion_entity_type,
-                "--orion-timeout-seconds",
-                str(args.orion_timeout_seconds),
-                "--orion-batch-size",
-                str(args.orion_batch_size),
-                "--fiware-service",
-                args.fiware_service,
-                "--fiware-service-path",
-                args.fiware_service_path,
-            ],
-            (
-                assignments,
-                classifier_model,
-                regressor_model,
-                classified,
-                calendar,
-            ),
+            publish.name,
+            publish.command,
+            publish.inputs,
+            publish.outputs,
+            ("finalize_run",),
+        )
+    return graph
+
+
+def build_file_pipeline_graph(
+    python: str,
+    args: argparse.Namespace,
+) -> dict[str, Node]:
+    if args.pipeline == "zone-fraction":
+        annual_input = getattr(args, "annual_input", None) or Path(
+            "data_csv_parquet/andria_distribuzione_annuale_completa.parquet"
+        )
+        graph = build_complete_parquet_graph(
+            python,
+            str(args.seed),
+            str(args.anno),
+            args.output_dir,
+            annual_input,
+            args.production_input,
+            args.collections_input,
+            args.calendar_input,
+            getattr(args, "annual_seed", 42),
+            getattr(args, "scenario_seed", 42),
+            getattr(args, "spillover_days", 14),
+            getattr(args, "missing_calendar_mode", "error"),
+            getattr(args, "generator_version", "unversioned-current"),
+            getattr(args, "exclude_episodic_fractions", False),
+            getattr(args, "hgb_loss", "poisson"),
+            getattr(args, "include_arima", False),
+            getattr(args, "validation_strategy", "fixed"),
+            getattr(args, "validation_folds", 5),
             (),
-            (regression_node,),
+            getattr(args, "forecast_from_date", None),
+            getattr(args, "forecast_to_date", None),
+            Path(args.forecast_calendar),
+        )
+        if getattr(args, "publish_orion", False):
+            output_dir = local_path(args.output_dir, str(args.output_dir))
+            append_orion_publication(
+                graph,
+                python=python,
+                dependency="finalize_run",
+                output_dir=output_dir,
+                assignments=output_dir / "data" / "kmeans_assignments.parquet",
+                classifier_model=output_dir / "models" / "kmeans_model.joblib",
+                regressor_model=output_dir
+                / "models"
+                / "zone_fraction_arima.joblib",
+                predictions=output_dir / "predictions" / "future.parquet",
+                forecast_from_date=args.forecast_from_date,
+                forecast_to_date=args.forecast_to_date,
+                orion_url=args.orion_url,
+                orion_entity_type=args.orion_entity_type,
+                orion_timeout_seconds=args.orion_timeout_seconds,
+                orion_batch_size=args.orion_batch_size,
+                fiware_service=args.fiware_service,
+                fiware_service_path=args.fiware_service_path,
+                pipeline_name="zone-fraction",
+            )
+        return graph
+
+    graph = build_graph(
+        python,
+        str(args.seed),
+        str(args.anno),
+        args.output_dir,
+        getattr(args, "annual_input", None),
+        args.calendar_input,
+        args.regressor,
+        args.gpr_max_train_rows,
+        getattr(args, "forecast_from_date", None),
+        getattr(args, "forecast_to_date", None),
+        Path(args.forecast_calendar),
+        args.arima_group_level,
+        getattr(args, "arima_group_by", "cluster"),
+    )
+    if not getattr(args, "forecast_from_date", None) or args.regressor == "arima":
+        return graph
+
+    output_dir = args.output_dir
+    selected_calendar = local_path(
+        Path(args.forecast_calendar), str(args.calendar_input)
+    )
+    regressor_model, metrics, predictions = regression_artifacts(
+        output_dir,
+        args.regressor,
+        args.arima_group_level,
+        getattr(args, "arima_group_by", "cluster"),
+    )
+    classifier_model = artifact(
+        output_dir, "models/kmeans_model_annuo_peso_coord.joblib"
+    )
+    append_orion_publication(
+        graph,
+        python=python,
+        dependency=f"grouped_{args.regressor}",
+        output_dir=output_dir,
+        assignments=artifact(
+            output_dir,
+            "data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv",
+        ),
+        classifier_model=classifier_model,
+        regressor_model=regressor_model,
+        history=artifact(
+            output_dir,
+            "data_csv_parquet/conferimenti_giornalieri_classificati.csv",
+        ),
+        calendar=selected_calendar,
+        training_to_date=f"{args.anno}-12-31T23:59:59Z",
+        forecast_from_date=args.forecast_from_date,
+        forecast_to_date=args.forecast_to_date,
+        orion_url=args.orion_url,
+        orion_entity_type=args.orion_entity_type,
+        orion_timeout_seconds=args.orion_timeout_seconds,
+        orion_batch_size=args.orion_batch_size,
+        fiware_service=args.fiware_service,
+        fiware_service_path=args.fiware_service_path,
+        publish=getattr(args, "publish_orion", False),
+    )
+    append_run_finalizer(
+        graph,
+        python=python,
+        pipeline_name="legacy",
+        source="file",
+        output_dir=output_dir,
+        model_name=args.regressor,
+        test_input=predictions,
+        model_paths=(regressor_model, classifier_model),
+        metrics_paths=(metrics,),
+        needs=("stage_digital_twins",),
+        input_paths=(
+            local_path(
+                getattr(args, "annual_input", None),
+                "data_csv_parquet/"
+                "andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+            ),
+            selected_calendar,
+        ),
+        future_path=artifact(output_dir, "predictions/future.parquet"),
+    )
+    if "publish_digital_twins" in graph:
+        publish = graph.pop("publish_digital_twins")
+        graph["publish_digital_twins"] = Node(
+            publish.name,
+            publish.command,
+            publish.inputs,
+            publish.outputs,
+            ("finalize_run",),
         )
     return graph
 
@@ -885,6 +1449,11 @@ def main() -> None:
     parser.add_argument("--seed", default=os.environ.get("SEED", "42"))
     parser.add_argument("--anno", default=os.environ.get("ANNO", "2024"))
     parser.add_argument(
+        "--pipeline",
+        choices=["legacy", "zone-fraction"],
+        help="Training implementation; defaults to legacy for compatibility.",
+    )
+    parser.add_argument(
         "--regressor",
         choices=["sgd", "gpr", "hist_gradient_boosting", "arima"],
         default="sgd",
@@ -902,9 +1471,7 @@ def main() -> None:
     parser.add_argument(
         "--annual-input",
         type=Path,
-        default=Path(
-            "data_csv_parquet/andria_distribuzione_annuale_completa.parquet"
-        ),
+        help="Annual input; the default depends on the selected pipeline.",
     )
     parser.add_argument(
         "--production-input",
@@ -951,6 +1518,14 @@ def main() -> None:
     parser.add_argument("--from-date")
     parser.add_argument("--to-date")
     parser.add_argument("--ql-id-pattern")
+    parser.add_argument(
+        "--ql-collections-only",
+        action="store_true",
+        help=(
+            "For zone-fraction QuantumLeap training, fetch collection history only "
+            "and skip theoretical-production validation."
+        ),
+    )
     parser.add_argument(
         "--ql-url", default=os.environ.get("QL_URL", "http://localhost:8668")
     )
@@ -1006,6 +1581,25 @@ def main() -> None:
         self_check()
         return
 
+    if args.source == "complete-parquet":
+        if args.pipeline not in (None, "zone-fraction"):
+            parser.error("--source complete-parquet conflicts with --pipeline legacy")
+        print(
+            "warning: --source complete-parquet is deprecated; use "
+            "--pipeline zone-fraction --source file",
+            file=sys.stderr,
+        )
+        args.pipeline = "zone-fraction"
+        args.source = "file"
+    args.pipeline = args.pipeline or "legacy"
+    if args.ql_collections_only and not (
+        args.pipeline == "zone-fraction" and args.source == "quantumleap"
+    ):
+        parser.error(
+            "--ql-collections-only requires "
+            "--pipeline zone-fraction --source quantumleap"
+        )
+
     if args.gpr_max_train_rows <= 0:
         parser.error("--gpr-max-train-rows must be greater than zero")
     if args.spillover_days < 0:
@@ -1017,24 +1611,25 @@ def main() -> None:
         parser.error(
             "--forecast-from-date and --forecast-to-date must be supplied together"
         )
-    if args.regressor == "arima" and args.publish_orion:
+    if (
+        args.pipeline == "legacy"
+        and args.regressor == "arima"
+        and args.publish_orion
+    ):
         parser.error("ARIMA supports batch files, not --publish-orion")
-    if args.arima_group_level and args.regressor != "arima":
+    if (
+        args.pipeline == "legacy"
+        and args.arima_group_level
+        and args.regressor != "arima"
+    ):
         parser.error("--arima-group-level requires --regressor arima")
-    if args.arima_group_by == "zone" and not (
+    if args.pipeline == "legacy" and args.arima_group_by == "zone" and not (
         args.regressor == "arima" and args.arima_group_level
     ):
         parser.error(
             "--arima-group-by zone requires --regressor arima "
             "and --arima-group-level"
         )
-    if (
-        args.forecast_from_date
-        and args.regressor != "arima"
-        and not args.publish_orion
-    ):
-        parser.error("forecast dates without --publish-orion require --regressor arima")
-
     if args.source == "quantumleap":
         if not args.from_date or not args.to_date:
             parser.error(
@@ -1050,8 +1645,6 @@ def main() -> None:
             parser.error("--ql-timeout-seconds must be greater than zero")
 
     if args.publish_orion:
-        if args.source != "quantumleap":
-            parser.error("--publish-orion requires --source quantumleap")
         if not args.forecast_from_date or not args.forecast_to_date:
             parser.error(
                 "--forecast-from-date and --forecast-to-date are required "
@@ -1060,9 +1653,11 @@ def main() -> None:
         try:
             forecast_start = date.fromisoformat(args.forecast_from_date)
             forecast_end = date.fromisoformat(args.forecast_to_date)
-            training_end = datetime.fromisoformat(
-                args.to_date.replace("Z", "+00:00")
-            ).date()
+            training_end = (
+                datetime.fromisoformat(args.to_date.replace("Z", "+00:00")).date()
+                if args.source == "quantumleap"
+                else date(int(args.anno), 12, 31)
+            )
         except (AttributeError, ValueError) as exc:
             parser.error(f"Invalid publication date: {exc}")
         if forecast_start > forecast_end:
@@ -1072,50 +1667,10 @@ def main() -> None:
         if args.orion_timeout_seconds <= 0 or args.orion_batch_size <= 0:
             parser.error("Orion timeout and batch size must be greater than zero")
 
-    if args.source == "complete-parquet":
-        if args.output_dir is None:
-            parser.error("--output-dir is required for --source complete-parquet")
-        graph = build_complete_parquet_graph(
-            args.python,
-            args.seed,
-            args.anno,
-            args.output_dir,
-            args.annual_input,
-            args.production_input,
-            args.collections_input,
-            args.calendar_input,
-            args.annual_seed,
-            args.scenario_seed,
-            args.spillover_days,
-            args.missing_calendar_mode,
-            args.generator_version,
-            args.exclude_episodic_fractions,
-            args.hgb_loss,
-            args.include_arima,
-            args.validation_strategy,
-            args.validation_folds,
-        )
-        if args.print_graph:
-            print_mermaid(graph)
-            return
-        run_graph(graph, force=args.force, dry_run=args.dry_run)
-        return
-
+    if args.pipeline == "zone-fraction" and args.output_dir is None:
+        parser.error("--output-dir is required for --pipeline zone-fraction")
     if args.source == "file":
-        graph = build_graph(
-            args.python,
-            args.seed,
-            args.anno,
-            args.output_dir,
-            calendar_input=args.calendar_input,
-            regressor=args.regressor,
-            gpr_max_train_rows=args.gpr_max_train_rows,
-            forecast_from_date=args.forecast_from_date,
-            forecast_to_date=args.forecast_to_date,
-            forecast_calendar=Path(args.forecast_calendar),
-            arima_group_level=args.arima_group_level,
-            arima_group_by=args.arima_group_by,
-        )
+        graph = build_file_pipeline_graph(args.python, args)
         if args.print_graph:
             print_mermaid(graph)
             return
@@ -1123,7 +1678,18 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory(prefix="quantumleap-training-") as tmp:
-        graph = build_quantumleap_graph(args.python, args.seed, Path(tmp), args)
+        graph = (
+            build_zone_fraction_quantumleap_graph(
+                args.python,
+                args.seed,
+                args.anno,
+                args.output_dir,
+                args.calendar_input,
+                args,
+            )
+            if args.pipeline == "zone-fraction"
+            else build_quantumleap_graph(args.python, args.seed, Path(tmp), args)
+        )
         if args.print_graph:
             print_mermaid(graph)
             return

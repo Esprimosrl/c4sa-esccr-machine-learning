@@ -114,6 +114,7 @@ autocorrelation_plot = load_module(
 publisher = load_module(
     "publish_digital_twins", "model-training/publish_digital_twins.py"
 )
+finalizer = load_module("finalize_run", "model-training/finalize_run.py")
 
 
 class Response:
@@ -432,9 +433,47 @@ def test_annual_rejects_unknown_fraction_and_static_conflict():
         prepare.annual_rows(rows)
 
 
+def test_complete_quantumleap_history_materializes_pipeline_snapshots():
+    rows = daily_rows().iloc[:3].copy()
+    rows["produzione_teorica_t"] = rows["conferimento_t"]
+    rows["conferimento_data"] = rows["timestamp"]
+    rows["raccolta_prevista"] = 1
+    rows["prg_error"] = ""
+    rows["zona_raccolta_inferita"] = False
+    rows["zona_costruzione_riassegnata"] = False
+    rows["distanza_inferenza_zona_raccolta_gradi"] = 0.0
+    rows["distanza_riassegnazione_prg"] = 0.0
+
+    annual, production, collections = prepare.complete_snapshots(rows)
+
+    assert annual.loc[0, "anno"] == 2024
+    assert annual.loc[0, "vetro_t"] == pytest.approx(3.5)
+    assert annual.loc[0, "carta_cartone_t"] == pytest.approx(4.0)
+    assert set(
+        [
+            "produzione_teorica_t",
+            "conferimento_data",
+            "raccolta_prevista",
+        ]
+    ) <= set(production)
+    assert collections["conferimento_t"].sum() == pytest.approx(7.5)
+
+
+def test_collection_history_materializes_snapshots_without_production():
+    rows = daily_rows().iloc[:3].copy()
+    rows["data"] = rows["timestamp"]
+
+    annual, collections = prepare.collection_snapshots(rows)
+
+    assert annual.loc[0, "anno"] == 2024
+    assert annual.loc[0, "totale_t"] == pytest.approx(7.5)
+    assert "produzione_teorica_t" not in collections
+    assert collections["conferimento_t"].sum() == pytest.approx(7.5)
+
+
 def test_pipeline_modes_preserve_file_graph_and_order_quantumleap(tmp_path):
     assert list(pipeline.build_graph("python", "42", "2024")) == [
-        "kmeans", "daily_distribution", "grouped_sgd"
+        "kmeans", "daily_distribution", "grouped_sgd", "finalize_run"
     ]
     output_dir = tmp_path / "isolated"
     file_graph = pipeline.build_graph("python", "42", "2024", output_dir)
@@ -484,7 +523,12 @@ def test_pipeline_modes_preserve_file_graph_and_order_quantumleap(tmp_path):
     )
     graph = pipeline.build_quantumleap_graph("python", "42", tmp_path, args)
     assert [node.name for node in pipeline.topo_sort(graph)] == [
-        "quantumleap_fetch", "annual_aggregation", "kmeans", "cluster_join", "grouped_sgd"
+        "quantumleap_fetch",
+        "annual_aggregation",
+        "kmeans",
+        "cluster_join",
+        "grouped_sgd",
+        "finalize_run",
     ]
 
     args.publish_orion = True
@@ -503,17 +547,156 @@ def test_pipeline_modes_preserve_file_graph_and_order_quantumleap(tmp_path):
         "kmeans",
         "cluster_join",
         "grouped_sgd",
+        "stage_digital_twins",
+        "finalize_run",
         "publish_digital_twins",
     ]
     publish = graph["publish_digital_twins"]
-    assert publish.needs == ("grouped_sgd",)
-    assert "--forecast-from-date" in publish.command
+    assert publish.needs == ("finalize_run",)
     assert "http://orion:1026" in publish.command
+    stage = graph["stage_digital_twins"]
+    assert "--forecast-from-date" in stage.command
     assert (
         str(output_dir / "models/kmeans_model_annuo_peso_coord.joblib")
-        in publish.command
+        in stage.command
     )
-    assert str(output_dir / "models/grouped_sgd_time_series.joblib") in publish.command
+    assert str(output_dir / "models/grouped_sgd_time_series.joblib") in stage.command
+
+
+def test_zone_fraction_quantumleap_graph_materializes_complete_inputs(tmp_path):
+    args = SimpleNamespace(
+        from_date="2024-01-01T00:00:00Z",
+        to_date="2024-12-31T23:59:59Z",
+        ql_url="http://ql",
+        ql_entity_type="Waste",
+        fiware_service="tenant",
+        fiware_service_path="/",
+        ql_timeout_seconds=30,
+        ql_id_pattern=None,
+        include_arima=False,
+        publish_orion=False,
+    )
+
+    graph = pipeline.build_zone_fraction_quantumleap_graph(
+        "python", "42", "2024", tmp_path / "out", Path("calendar.csv"), args
+    )
+
+    assert list(graph)[:2] == ["quantumleap_fetch", "quantumleap_snapshot"]
+    assert "--profile" in graph["quantumleap_fetch"].command
+    assert "complete" in graph["quantumleap_fetch"].command
+    assert graph["kmeans"].needs == ("quantumleap_snapshot",)
+    assert graph["finalize_run"].command[
+        graph["finalize_run"].command.index("--source") + 1
+    ] == "quantumleap"
+
+
+def test_zone_fraction_quantumleap_graph_can_use_collections_only(tmp_path):
+    args = SimpleNamespace(
+        from_date="2024-01-01T00:00:00Z",
+        to_date="2024-12-31T23:59:59Z",
+        ql_url="http://ql",
+        ql_entity_type="Waste",
+        fiware_service="tenant",
+        fiware_service_path="/",
+        ql_timeout_seconds=30,
+        ql_id_pattern=None,
+        ql_collections_only=True,
+        include_arima=False,
+        publish_orion=False,
+    )
+
+    graph = pipeline.build_zone_fraction_quantumleap_graph(
+        "python", "42", "2024", tmp_path / "out", Path("calendar.csv"), args
+    )
+
+    assert "legacy" in graph["quantumleap_fetch"].command
+    assert "snapshot-collections" in graph["quantumleap_snapshot"].command
+    assert not any(
+        path.name == "production.parquet"
+        for path in graph["quantumleap_snapshot"].outputs
+    )
+    assert "--production-input" not in graph["prepare_zone_fraction"].command
+
+
+def test_canonical_prediction_twins_reuse_existing_entity_contract(tmp_path):
+    assignments = pd.DataFrame(
+        {
+            "id_civico": ["10"],
+            "anno_from_col": [2024],
+            "coord_x": [16.3],
+            "coord_y": [41.2],
+            "densita_locale": [100.0],
+            "zona_raccolta": [1],
+            "cluster_label": [3],
+            "cluster_distance": [0.2],
+        }
+    )
+    predictions = pd.DataFrame(
+        {
+            "id_civico": ["10"],
+            "data": [pd.Timestamp("2025-01-07")],
+            "frazione": ["vetro"],
+            "prediction_t": [0.25],
+        }
+    )
+    assignments_path = tmp_path / "assignments.parquet"
+    predictions_path = tmp_path / "future.parquet"
+    prepare.write_parquet(assignments, assignments_path)
+    prepare.write_parquet(predictions, predictions_path)
+    classifier = tmp_path / "classifier.joblib"
+    regressor = tmp_path / "regressor.joblib"
+    classifier.write_bytes(b"classifier")
+    regressor.write_bytes(b"regressor")
+    stage = tmp_path / "twins.jsonl"
+
+    count = publisher.stage_prediction_twins(
+        predictions_path,
+        assignments_path,
+        classifier,
+        regressor,
+        publisher.parse_day("2025-01-01"),
+        publisher.parse_day("2025-01-31"),
+        "RifiutiDigitalTwin",
+        stage,
+    )
+
+    assert count == 1
+    entity = json.loads(stage.read_text())
+    assert entity["id"] == "urn:ngsi-v2:RifiutiDigitalTwin:10:2025"
+    assert entity["future_values"]["value"] == [
+        {"date": "2025-01-07", "values_t": {"vetro": 0.25}}
+    ]
+    canonical = tmp_path / "canonical.parquet"
+    assert (
+        publisher.write_canonical_predictions_from_stage(
+            stage, assignments_path, canonical, "legacy", "sgd"
+        )
+        == 1
+    )
+    canonical_row = duckdb.connect().execute(
+        "SELECT * FROM read_parquet(?)", [str(canonical)]
+    ).fetchone()
+    assert canonical_row[0] == "10"
+    assert canonical_row[3] == pytest.approx(0.25)
+
+
+def test_finalizer_normalizes_legacy_predictions():
+    frame = pd.DataFrame(
+        {
+            "id_civico": ["10"],
+            "data_dt": [pd.Timestamp("2024-12-01")],
+            "frazione": ["vetro"],
+            "pred_conferimento_t": [0.5],
+            "zona_raccolta": [1],
+            "cluster_label": [3],
+        }
+    )
+
+    result = finalizer.canonicalize(frame, "legacy", "sgd", None)
+
+    assert list(result) == finalizer.CANONICAL_COLUMNS
+    assert result.loc[0, "prediction_t"] == pytest.approx(0.5)
+    assert result.loc[0, "pipeline"] == "legacy"
 
 
 def test_gpr_sampling_is_capped_deterministic_and_time_stratified():

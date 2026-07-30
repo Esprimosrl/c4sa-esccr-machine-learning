@@ -122,6 +122,8 @@ def test_quantumleap_job_can_publish_to_orion(tmp_path, monkeypatch):
         "kmeans",
         "cluster_join",
         "grouped_gpr",
+        "stage_digital_twins",
+        "finalize_run",
         "publish_digital_twins",
     ]
     fetch = graph["quantumleap_fetch"].command
@@ -130,16 +132,52 @@ def test_quantumleap_job_can_publish_to_orion(tmp_path, monkeypatch):
     assert "2024-12-31T23:59:59Z" in fetch
     assert ".*:vetro" in fetch
     publish = graph["publish_digital_twins"].command
+    stage = graph["stage_digital_twins"].command
     assert "http://orion:1026" in publish
-    assert str(calendar.resolve()) in publish
+    assert str(calendar.resolve()) in stage
     gpr_command = graph["grouped_gpr"].command
     assert gpr_command[gpr_command.index("--regressor") + 1] == "gpr"
     assert gpr_command[gpr_command.index("--gpr-max-train-rows") + 1] == "321"
-    assert graph["publish_digital_twins"].needs == ("grouped_gpr",)
-    assert any("grouped_gpr_time_series.joblib" in value for value in publish)
+    assert graph["publish_digital_twins"].needs == ("finalize_run",)
+    assert any("grouped_gpr_time_series.joblib" in value for value in stage)
     for name in ("kmeans", "grouped_gpr"):
         command = graph[name].command
         assert command[command.index("--seed") + 1] == "7"
+
+
+def test_zone_fraction_quantumleap_job_uses_complete_snapshot_graph(
+    tmp_path, monkeypatch
+):
+    _, calendar = local_files(tmp_path)
+    captured = {}
+
+    def run_graph(graph, force, dry_run):
+        captured["graph"] = graph
+
+    monkeypatch.setattr(training_api.pipeline, "run_graph", run_graph)
+    job = submit(
+        {
+            "source": "quantumleap",
+            "pipeline": "zone-fraction",
+            "from_date": "2024-01-01",
+            "to_date": "2024-12-31",
+            "calendar_input_path": str(calendar),
+            "output_dir": str(tmp_path / "zone-output"),
+            "orion": {
+                "forecast_from_date": "2025-01-01",
+                "forecast_to_date": "2025-01-31",
+            },
+        }
+    )
+
+    assert training_api.get_training_job(job.job_id).status == "succeeded"
+    graph = captured["graph"]
+    assert list(graph)[:2] == ["quantumleap_fetch", "quantumleap_snapshot"]
+    assert "prepare_zone_fraction" in graph
+    assert "forecast_zone_fraction" in graph
+    assert "publish_digital_twins" in graph
+    assert "finalize_run" in graph
+    assert graph["kmeans"].needs == ("quantumleap_snapshot",)
 
 
 def test_arima_job_routes_future_batch_outputs(tmp_path, monkeypatch):

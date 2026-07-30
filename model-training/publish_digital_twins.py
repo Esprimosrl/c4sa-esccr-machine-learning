@@ -55,6 +55,11 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_table(path: Path) -> pd.DataFrame:
+    reader = "read_csv_auto(?)" if path.suffix.lower() == ".csv" else "read_parquet(?)"
+    return duckdb.connect().execute(f"SELECT * FROM {reader}", [str(path)]).df()
+
+
 def normalize_zone(value: object) -> str:
     text = str(value).strip()
     try:
@@ -312,9 +317,7 @@ def stage_twins(
 ) -> int:
     if not entity_type.strip():
         raise ValueError("Orion entity type must not be empty.")
-    assignments = duckdb.connect().execute(
-        "SELECT * FROM read_parquet(?)", [str(assignments_path)]
-    ).df()
+    assignments = read_table(assignments_path)
     bundle = joblib.load(regressor_path)
     if bundle.get("model_name") not in {
         "grouped_sgd",
@@ -456,6 +459,168 @@ def stage_twins(
     return entity_count
 
 
+def stage_prediction_twins(
+    predictions_path: Path,
+    assignments_path: Path,
+    classifier_path: Path,
+    regressor_path: Path,
+    forecast_start: date,
+    forecast_end: date,
+    entity_type: str,
+    output_path: Path,
+) -> int:
+    predictions = read_table(predictions_path)
+    required = {"id_civico", "data", "frazione", "prediction_t"}
+    if missing := required - set(predictions.columns):
+        raise ValueError(
+            "Canonical predictions missing columns: " + ", ".join(sorted(missing))
+        )
+    predictions = predictions.copy()
+    predictions["id_civico"] = predictions["id_civico"].astype("string")
+    predictions["data"] = pd.to_datetime(predictions["data"], errors="raise").dt.date
+    predictions["prediction_t"] = pd.to_numeric(
+        predictions["prediction_t"], errors="raise"
+    )
+    if (
+        predictions["id_civico"].isna().any()
+        or predictions["frazione"].isna().any()
+        or (~np.isfinite(predictions["prediction_t"])).any()
+        or (predictions["prediction_t"] < 0).any()
+    ):
+        raise ValueError("Canonical predictions contain invalid values.")
+    if predictions.duplicated(["id_civico", "data", "frazione"]).any():
+        raise ValueError("Canonical predictions contain duplicate civic/date/fraction rows.")
+    if not predictions["data"].map(
+        lambda value: forecast_start <= value <= forecast_end
+    ).all():
+        raise ValueError("Canonical predictions fall outside the forecast range.")
+
+    assignments = read_table(assignments_path)
+    classifier_version = file_sha256(classifier_path)
+    regressor_version = file_sha256(regressor_path)
+    observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    entity_count = 0
+    with output_path.open("w", encoding="utf-8") as output:
+        for year, year_start, year_end in split_years(forecast_start, forecast_end):
+            selected = latest_assignments(assignments, year)
+            year_predictions = predictions[
+                predictions["data"].map(lambda value: value.year == year)
+            ]
+            grouped = {
+                str(civic): {
+                    event_date: {
+                        str(row.frazione): float(row.prediction_t)
+                        for row in rows.itertuples(index=False)
+                    }
+                    for event_date, rows in civic_rows.groupby("data", sort=True)
+                }
+                for civic, civic_rows in year_predictions.groupby(
+                    "id_civico", sort=False
+                )
+            }
+            for _, assignment in selected.iterrows():
+                civic = str(assignment["id_civico"])
+                entity = build_entity(
+                    assignment,
+                    year,
+                    year_start,
+                    year_end,
+                    grouped.get(civic, {}),
+                    entity_type,
+                    classifier_version,
+                    regressor_version,
+                    observed_at,
+                )
+                output.write(json.dumps(entity, separators=(",", ":")) + "\n")
+                entity_count += 1
+    return entity_count
+
+
+def write_canonical_predictions_from_stage(
+    stage_path: Path,
+    assignments_path: Path,
+    output_path: Path,
+    pipeline_name: str,
+    model_name: str,
+) -> int:
+    assignments = read_table(assignments_path)
+    assignment_rows: dict[tuple[str, int], tuple[object, object]] = {}
+    with stage_path.open(encoding="utf-8") as stream:
+        forecast_years = {
+            int(json.loads(line)["forecast_year"]["value"]) for line in stream
+        }
+    for year in sorted(forecast_years):
+        for row in latest_assignments(assignments, year).itertuples(index=False):
+            assignment_rows[(str(row.id_civico), year)] = (
+                getattr(row, "zona_raccolta"),
+                getattr(row, "cluster_label"),
+            )
+
+    con = duckdb.connect()
+    con.execute("""
+        CREATE TABLE canonical (
+            id_civico VARCHAR,
+            data DATE,
+            frazione VARCHAR,
+            prediction_t DOUBLE,
+            prediction_lower_t DOUBLE,
+            prediction_upper_t DOUBLE,
+            pipeline VARCHAR,
+            model VARCHAR,
+            forecast_method VARCHAR,
+            zona_raccolta VARCHAR,
+            cluster_label INTEGER
+        )
+    """)
+    rows: list[tuple[object, ...]] = []
+    count = 0
+    with stage_path.open(encoding="utf-8") as stream:
+        for line in stream:
+            entity = json.loads(line)
+            civic = str(entity["id_civico"]["value"])
+            year = int(entity["forecast_year"]["value"])
+            zone, cluster = assignment_rows[(civic, year)]
+            for event in entity["future_values"]["value"]:
+                for fraction, prediction in event["values_t"].items():
+                    rows.append(
+                        (
+                            civic,
+                            event["date"],
+                            fraction,
+                            float(prediction),
+                            None,
+                            None,
+                            pipeline_name,
+                            model_name,
+                            model_name,
+                            str(zone),
+                            int(cluster),
+                        )
+                    )
+                    count += 1
+                    if len(rows) == 10_000:
+                        con.executemany(
+                            "INSERT INTO canonical VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            rows,
+                        )
+                        rows.clear()
+    if rows:
+        con.executemany(
+            "INSERT INTO canonical VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    con.execute(
+        "COPY (SELECT * FROM canonical ORDER BY data, zona_raccolta, "
+        "frazione, cluster_label, id_civico) TO ? "
+        "(FORMAT PARQUET, COMPRESSION ZSTD)",
+        [str(output_path)],
+    )
+    con.close()
+    return count
+
+
 def publish_twins(
     stage_path: Path,
     orion_url: str,
@@ -481,15 +646,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate inferred civic/year twins and publish them to Orion."
     )
-    parser.add_argument("--assignments", type=Path, required=True)
-    parser.add_argument("--classifier-model", type=Path, required=True)
-    parser.add_argument("--regressor-model", type=Path, required=True)
+    parser.add_argument("--assignments", type=Path)
+    parser.add_argument("--classifier-model", type=Path)
+    parser.add_argument("--regressor-model", type=Path)
     parser.add_argument("--history", type=Path)
-    parser.add_argument("--calendar", type=Path, required=True)
-    parser.add_argument("--forecast-from-date", required=True)
-    parser.add_argument("--forecast-to-date", required=True)
-    parser.add_argument("--training-to-date", required=True)
-    parser.add_argument("--stage-output", type=Path, required=True)
+    parser.add_argument("--calendar", type=Path)
+    parser.add_argument("--predictions", type=Path)
+    parser.add_argument("--predictions-output", type=Path)
+    parser.add_argument("--pipeline", default="legacy")
+    parser.add_argument("--forecast-from-date")
+    parser.add_argument("--forecast-to-date")
+    parser.add_argument("--training-to-date")
+    parser.add_argument("--stage-output", type=Path)
+    parser.add_argument("--publish-stage", type=Path)
+    parser.add_argument("--stage-only", action="store_true")
     parser.add_argument("--orion-url", required=True)
     parser.add_argument("--orion-entity-type", required=True)
     parser.add_argument("--orion-timeout-seconds", type=float, required=True)
@@ -498,29 +668,81 @@ def main() -> None:
     parser.add_argument("--fiware-service-path", required=True)
     args = parser.parse_args()
 
+    if args.publish_stage:
+        published = publish_twins(
+            args.publish_stage,
+            args.orion_url,
+            args.fiware_service,
+            args.fiware_service_path,
+            args.orion_timeout_seconds,
+            args.orion_batch_size,
+        )
+        print(f"published {published} {args.orion_entity_type} entities")
+        return
+    required = {
+        "--assignments": args.assignments,
+        "--classifier-model": args.classifier_model,
+        "--regressor-model": args.regressor_model,
+        "--forecast-from-date": args.forecast_from_date,
+        "--forecast-to-date": args.forecast_to_date,
+        "--stage-output": args.stage_output,
+    }
+    if missing := [name for name, value in required.items() if value is None]:
+        parser.error("required arguments: " + ", ".join(missing))
+    if args.predictions is None and (
+        args.calendar is None or args.training_to_date is None
+    ):
+        parser.error(
+            "--calendar and --training-to-date are required without --predictions"
+        )
     forecast_start = parse_day(args.forecast_from_date)
     forecast_end = parse_day(args.forecast_to_date)
-    training_end = datetime.fromisoformat(
-        args.training_to_date.replace("Z", "+00:00")
-    ).date()
     if forecast_start > forecast_end:
         raise ValueError("forecast-from-date must not be after forecast-to-date.")
-    if forecast_start <= training_end:
-        raise ValueError("Forecast dates must be after the training range.")
+    if args.training_to_date:
+        training_end = datetime.fromisoformat(
+            args.training_to_date.replace("Z", "+00:00")
+        ).date()
+        if forecast_start <= training_end:
+            raise ValueError("Forecast dates must be after the training range.")
     if args.orion_timeout_seconds <= 0 or args.orion_batch_size <= 0:
         raise ValueError("Orion timeout and batch size must be greater than zero.")
 
-    staged = stage_twins(
-        args.assignments,
-        args.classifier_model,
-        args.regressor_model,
-        args.calendar,
-        forecast_start,
-        forecast_end,
-        args.orion_entity_type,
-        args.stage_output,
-        args.history,
-    )
+    if args.predictions:
+        staged = stage_prediction_twins(
+            args.predictions,
+            args.assignments,
+            args.classifier_model,
+            args.regressor_model,
+            forecast_start,
+            forecast_end,
+            args.orion_entity_type,
+            args.stage_output,
+        )
+    else:
+        staged = stage_twins(
+            args.assignments,
+            args.classifier_model,
+            args.regressor_model,
+            args.calendar,
+            forecast_start,
+            forecast_end,
+            args.orion_entity_type,
+            args.stage_output,
+            args.history,
+        )
+        if args.predictions_output:
+            bundle = joblib.load(args.regressor_model)
+            write_canonical_predictions_from_stage(
+                args.stage_output,
+                args.assignments,
+                args.predictions_output,
+                args.pipeline,
+                str(bundle.get("model_name", "unknown")),
+            )
+    if args.stage_only:
+        print(f"staged {staged} {args.orion_entity_type} entities")
+        return
     published = publish_twins(
         args.stage_output,
         args.orion_url,

@@ -5,18 +5,28 @@ import math
 
 import joblib
 import numpy as np
+import pandas as pd
 import pytest
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
 from onnx_inference.app import (
     ModelPackage,
     PredictionInput,
     UnknownGroup,
+    ZoneFractionForecastRequest,
+    ZoneFractionPackage,
+    ZoneFractionPredictionInput,
     feature_values,
 )
-from onnx_inference.export_models import export_bundle
+from onnx_inference.export_models import export_bundle, export_zone_fraction_bundle
+from zone_fraction_benchmark import fit_sarima
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -220,3 +230,148 @@ def test_hist_gradient_boosting_bundle_exports_to_onnx(tmp_path: Path) -> None:
 
     assert len(manifest["groups"]) == 1
     assert (output / "models/000.onnx").exists()
+
+
+@pytest.mark.parametrize("selected_model", ["hist_gradient_boosting", "ridge"])
+def test_zone_fraction_package_serves_onnx_and_native_sarimax(
+    tmp_path: Path,
+    selected_model: str,
+) -> None:
+    numeric = ["giorni_dal_ritiro_precedente"]
+    categorical = ["zona_raccolta", "frazione", "cluster_label"]
+    training = pd.DataFrame(
+        {
+            "giorni_dal_ritiro_precedente": np.tile(
+                [2.0, 3.0, np.nan, 4.0], 10
+            ),
+            "zona_raccolta": np.tile(["1", "2"], 20),
+            "frazione": np.tile(["vetro", "carta_cartone"], 20),
+            "cluster_label": np.tile([0, 1], 20),
+        }
+    )
+    target = np.linspace(0.1, 1.0, len(training))
+    if selected_model == "hist_gradient_boosting":
+        numeric_transformer = SimpleImputer(
+            strategy="median",
+            add_indicator=True,
+        )
+        categorical_transformer = OrdinalEncoder(
+            handle_unknown="use_encoded_value",
+            unknown_value=-1,
+        )
+        estimator = HistGradientBoostingRegressor(
+            loss="poisson",
+            max_iter=5,
+            min_samples_leaf=2,
+            random_state=42,
+        )
+    else:
+        numeric_transformer = Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median", add_indicator=True),
+                ),
+                ("scale", StandardScaler()),
+            ]
+        )
+        categorical_transformer = OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False,
+        )
+        estimator = Ridge()
+    tabular_model = Pipeline(
+        [
+            (
+                "preprocess",
+                ColumnTransformer(
+                    [
+                        ("numeric", numeric_transformer, numeric),
+                        ("categorical", categorical_transformer, categorical),
+                    ],
+                    sparse_threshold=0.0,
+                ),
+            ),
+            ("model", estimator),
+        ]
+    ).fit(training, target)
+    tabular_path = tmp_path / "zone_fraction_benchmark.joblib"
+    joblib.dump(
+        {
+            "contract": "zone-fraction-scheduled-withdrawal-v1",
+            "selected_model": selected_model,
+            "models": {selected_model: tabular_model},
+            "numeric_features": numeric,
+            "categorical_features": categorical,
+        },
+        tabular_path,
+    )
+
+    dates = pd.date_range("2024-01-01", periods=21, freq="D")
+    exog = pd.DataFrame(
+        {
+            "giorni_dal_ritiro_precedente": np.tile([6.0, 7.0, 8.0], 7),
+            "is_holiday": 0.0,
+            "is_after_holiday": 0.0,
+        },
+        index=dates,
+    )
+    sarimax_model = fit_sarima(
+        pd.Series(np.linspace(0.1, 0.5, len(dates)), index=dates),
+        (0, 0, 0),
+        (0, 0, 0, 0),
+        exog,
+    )
+    sarimax_path = tmp_path / "zone_fraction_arima.joblib"
+    joblib.dump(
+        {
+            "contract": "zone-fraction-scheduled-withdrawal-v1",
+            "model_name": "zone_fraction_sarima",
+            "sarimax_exog_columns": tuple(exog.columns),
+            "sarimax_models": {
+                "scenario_seed=42|zona_raccolta=1|frazione=vetro|cluster_label=0": {
+                    "model": sarimax_model
+                }
+            },
+        },
+        sarimax_path,
+    )
+
+    model_dir = tmp_path / "zone-package"
+    manifest = export_zone_fraction_bundle(
+        tabular_path, sarimax_path, model_dir
+    )
+    assert (model_dir / "tabular_preprocessor.joblib").exists()
+    assert manifest["tabular"]["transformed_feature_count"] > len(
+        numeric + categorical
+    )
+    package = ZoneFractionPackage.load(model_dir, manifest)
+    instance = ZoneFractionPredictionInput(
+        giorni_dal_ritiro_precedente=None,
+        zona_raccolta="1",
+        frazione="vetro",
+        cluster_label=0,
+    )
+    expected = max(float(tabular_model.predict(pd.DataFrame([{
+        "giorni_dal_ritiro_precedente": np.nan,
+        "zona_raccolta": "1",
+        "frazione": "vetro",
+        "cluster_label": 0,
+    }]))[0]), 0.0)
+    assert package.predict([instance])[0] == pytest.approx(expected, rel=1e-5)
+
+    calendar = tmp_path / "calendar.csv"
+    calendar.write_text(
+        "zona_raccolta,frazione,weekday\n1,vetro,lunedi\n",
+        encoding="utf-8",
+    )
+    forecasts = package.forecast(
+        ZoneFractionForecastRequest(
+            forecast_from_date="2024-01-22",
+            forecast_to_date="2024-01-28",
+        ),
+        calendar,
+    )
+    assert forecasts
+    assert {row["frazione"] for row in forecasts} == {"vetro"}
+    assert all(np.isfinite(row["prediction_t"]) for row in forecasts)

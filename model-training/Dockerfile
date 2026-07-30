@@ -11,10 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 app \
     && install -d -o app -g app /artifacts
 
-COPY run_pipeline.sh quantumleap.py orion.py lag_features.py ./
-COPY model-training/ml_pipeline_graph.py model-training/prepare_quantumleap.py model-training/publish_digital_twins.py model-training/training_api.py model-training/zone_fraction_benchmark.py model-training/
-COPY model-training/classification/train_kmeans.py model-training/classification/kmeans_feature_tables.py model-training/classification/
-COPY model-training/regression/train_grouped_sgd_time_series_regressor.py model-training/regression/train_grouped_arima_time_series.py model-training/regression/modular_hist_gradient_boosting_regressor.py model-training/regression/
+COPY run_pipeline.sh quantumleap.py orion.py lag_features.py inference_data.py ./
+COPY model-training/ model-training/
 COPY dataset/distribuzione_giornaliera.py dataset/
 COPY data_csv_parquet/calendario_raccolta.csv data_csv_parquet/
 

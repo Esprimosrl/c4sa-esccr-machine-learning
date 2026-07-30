@@ -19,7 +19,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
-from skl2onnx.common.data_types import DoubleTensorType
+from skl2onnx.common.data_types import (
+    DoubleTensorType,
+    FloatTensorType,
+)
 from skl2onnx.operator_converters import random_forest as tree_converter
 
 
@@ -149,7 +152,10 @@ def validate_conversion(
 
 
 def convert_pipeline(
-    pipeline: Pipeline, name: str, feature_count: int
+    pipeline: Pipeline,
+    name: str,
+    feature_count: int | None = None,
+    initial_types: list[tuple[str, object]] | None = None,
 ) -> onnx.ModelProto:
     original = tree_converter.add_tree_to_attribute_pairs_hist_gradient_boosting
 
@@ -169,11 +175,158 @@ def convert_pipeline(
         return convert_sklearn(
             pipeline,
             name=name,
-            initial_types=[("features", DoubleTensorType([None, feature_count]))],
+            initial_types=initial_types
+            or [("features", DoubleTensorType([None, feature_count]))],
             target_opset=TARGET_OPSET,
         )
     finally:
         tree_converter.add_tree_to_attribute_pairs_hist_gradient_boosting = original
+
+
+def add_nonnegative_output(model: onnx.ModelProto) -> None:
+    if len(model.graph.output) != 1:
+        raise ValueError("Expected the zone/fraction regressor to have one output.")
+    raw_output = model.graph.output[0].name
+    del model.graph.output[:]
+    model.graph.initializer.extend(
+        [numpy_helper.from_array(np.array([0.0], dtype=np.float64), "__zone_zero")]
+    )
+    model.graph.node.extend(
+        [
+            helper.make_node("Cast", [raw_output], ["__zone_double"], to=TensorProto.DOUBLE),
+            helper.make_node(
+                "Max", ["__zone_double", "__zone_zero"], ["prediction_t"]
+            ),
+        ]
+    )
+    model.graph.output.extend(
+        [
+            helper.make_tensor_value_info(
+                "prediction_t", TensorProto.DOUBLE, [None, 1]
+            )
+        ]
+    )
+
+
+def add_zone_fraction_output(
+    model: onnx.ModelProto, estimator: object
+) -> None:
+    if (
+        isinstance(estimator, HistGradientBoostingRegressor)
+        and estimator.loss == "poisson"
+    ):
+        add_target_postprocessing(
+            model,
+            target_transform="identity",
+            model_name="grouped_hist_gradient_boosting",
+            upper_bound=None,
+        )
+        return
+    add_nonnegative_output(model)
+
+
+def export_zone_fraction_bundle(
+    input_path: Path,
+    sarimax_input_path: Path,
+    output_dir: Path,
+) -> dict[str, object]:
+    if output_dir.exists():
+        raise FileExistsError(
+            f"Output already exists: {output_dir}. Use a new versioned directory."
+        )
+
+    bundle = joblib.load(input_path)
+    if bundle.get("contract") != "zone-fraction-scheduled-withdrawal-v1":
+        raise ValueError("Input is not a zone/fraction benchmark bundle.")
+    selected_model = str(bundle["selected_model"])
+    pipeline = bundle["models"][selected_model]
+    preprocessor = pipeline.named_steps["preprocess"]
+    estimator = pipeline.named_steps["model"]
+    numeric_features = list(bundle["numeric_features"])
+    categorical_features = list(bundle["categorical_features"])
+    if categorical_features != ["zona_raccolta", "frazione", "cluster_label"]:
+        raise ValueError("Unsupported zone/fraction categorical features.")
+
+    sarimax_bundle = joblib.load(sarimax_input_path)
+    if (
+        sarimax_bundle.get("contract")
+        != "zone-fraction-scheduled-withdrawal-v1"
+        or sarimax_bundle.get("model_name") != "zone_fraction_sarima"
+    ):
+        raise ValueError("Input is not a zone/fraction SARIMAX bundle.")
+
+    onnx_model = convert_pipeline(
+        Pipeline([("model", estimator)]),
+        "zone_fraction_regression",
+        initial_types=[
+            (
+                "features",
+                FloatTensorType([None, int(estimator.n_features_in_)]),
+            )
+        ],
+    )
+    add_zone_fraction_output(onnx_model, estimator)
+    onnx.checker.check_model(onnx_model)
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent)
+    )
+    try:
+        onnx_path = stage / "tabular.onnx"
+        preprocessor_path = stage / "tabular_preprocessor.joblib"
+        sarimax_path = stage / "sarimax.joblib"
+        onnx.save_model(onnx_model, onnx_path)
+        joblib.dump(preprocessor, preprocessor_path)
+        shutil.copy2(sarimax_input_path, sarimax_path)
+
+        tabular_version = file_sha256(input_path)
+        sarimax_version = file_sha256(sarimax_input_path)
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "model_version": f"{tabular_version}:{sarimax_version}",
+            "task": "zone_fraction_regression",
+            "tabular": {
+                "model": "tabular.onnx",
+                "preprocessor": "tabular_preprocessor.joblib",
+                "selected_model": selected_model,
+                "transformed_feature_count": int(estimator.n_features_in_),
+                "version": tabular_version,
+                "inputs": [
+                    *(
+                        {"name": name, "dtype": "float32"}
+                        for name in numeric_features
+                    ),
+                    {"name": "zona_raccolta", "dtype": "string"},
+                    {"name": "frazione", "dtype": "string"},
+                    {"name": "cluster_label", "dtype": "int64"},
+                ],
+                "output": {
+                    "name": "prediction_t",
+                    "dtype": "float64",
+                    "unit": "t",
+                },
+            },
+            "sarimax": {
+                "model": "sarimax.joblib",
+                "format": "joblib-statsmodels",
+                "version": sarimax_version,
+                "group_count": len(sarimax_bundle["sarimax_models"]),
+                "exogenous_features": list(
+                    sarimax_bundle["sarimax_exog_columns"]
+                ),
+            },
+        }
+        (stage / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        stage.chmod(0o755)
+        os.replace(stage, output_dir)
+        return manifest
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
 
 
 def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
@@ -323,17 +476,32 @@ def export_bundle(input_path: Path, output_dir: Path) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export a grouped regressor joblib bundle as an ONNX package."
+        description="Export a regression model package for the inference service."
     )
     parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument(
+        "--sarimax-input",
+        type=Path,
+        help="Native zone/fraction SARIMAX bundle to include with the ONNX model.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    manifest = export_bundle(args.input, args.output_dir)
-    print(
-        f"exported {len(manifest['groups'])} models to {args.output_dir}; "
-        f"version={manifest['model_version']}"
-    )
+    if args.sarimax_input:
+        manifest = export_zone_fraction_bundle(
+            args.input, args.sarimax_input, args.output_dir
+        )
+        print(
+            "exported zone/fraction ONNX and "
+            f"{manifest['sarimax']['group_count']} native SARIMAX models "
+            f"to {args.output_dir}; version={manifest['model_version']}"
+        )
+    else:
+        manifest = export_bundle(args.input, args.output_dir)
+        print(
+            f"exported {len(manifest['groups'])} models to {args.output_dir}; "
+            f"version={manifest['model_version']}"
+        )
 
 
 if __name__ == "__main__":

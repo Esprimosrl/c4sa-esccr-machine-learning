@@ -1,122 +1,294 @@
 # Classificazione e previsione dei conferimenti rifiuti
 
-Questo progetto addestra e distribuisce due modelli:
+Questo repository addestra modelli per:
 
-- un classificatore K-means, che assegna ogni civico a un cluster usando i dati
-  annuali;
-- un regressore selezionabile, raggruppato per frazione e cluster, che stima le
-  tonnellate dei conferimenti futuri.
+- classificare i civici con K-means;
+- prevedere i conferimenti per data e frazione;
+- salvare risultati e metadati in file con un contratto comune;
+- pubblicare, su richiesta, le previsioni come digital twin in Orion;
+- eseguire inferenza con servizi ONNX sui modelli compatibili.
 
-I dati possono provenire da file locali oppure da QuantumLeap. I risultati
-possono essere pubblicati in Orion come entità `RifiutiDigitalTwin` e quindi
-salvati nuovamente in QuantumLeap tramite subscription Orion.
+Sono supportate due pipeline di training e due sorgenti dati. Le due scelte sono
+indipendenti:
 
-## Flusso completo
+| Scelta | Valori | Significato |
+| --- | --- | --- |
+| Pipeline | `legacy`, `zone-fraction` | Decide preparazione dati, feature e modelli |
+| Sorgente | `file`, `quantumleap` | Decide da dove arriva lo storico |
+
+Senza opzioni vengono usati `--pipeline legacy --source file`, per
+retrocompatibilità.
+
+## Scegliere la pipeline
+
+| Pipeline | Quando usarla | Come lavora |
+| --- | --- | --- |
+| `legacy` | Compatibilità con il flusso precedente e con i servizi ONNX | K-means annuale, poi regressori raggruppati per frazione/cluster |
+| `zone-fraction` | Dati completi di produzione e raccolta, calendario operativo e confronto tra più modelli | Costruisce i ritiri per zona/frazione/cluster, seleziona i modelli sulla validation e ripartisce i totali sui civici |
+
+Tutte le combinazioni sono supportate:
+
+| Pipeline | File | QuantumLeap | File futuri | Pubblicazione Orion |
+| --- | --- | --- | --- | --- |
+| `legacy` | sì | sì | sì | sì, tranne ARIMA |
+| `zone-fraction` | sì | sì | sì | sì |
+
+`--source complete-parquet` è ancora accettato, ma è un alias deprecato di
+`--pipeline zone-fraction --source file`.
+
+## Architettura
 
 ```mermaid
-flowchart TD
-    U[Utente o applicazione] -->|pubblica RifiutiConferimento| O[Orion]
-    O -->|subscription| Q[QuantumLeap]
-    Q --> A[Aggregazione annuale per civico]
-    A --> C[Classificazione K-means]
-    C --> J[Etichette unite ai dati giornalieri]
-    J --> R[Addestramento regressore raggruppato]
-    R --> F[Previsioni su intervallo futuro]
-    C --> T[RifiutiDigitalTwin]
-    F --> T
-    T -->|pubblicazione| O
+flowchart LR
+    CLI[CLI o Training API] --> S{Sorgente}
+    S -->|file| F[CSV / Parquet]
+    S -->|quantumleap| Q[QuantumLeap]
+    F --> K[K-means]
+    Q --> K
+    K --> P{Pipeline}
+    P -->|legacy| L[Regressori frazione / cluster]
+    P -->|zone-fraction| Z[Benchmark zona / frazione]
+    L --> O[Output comuni]
+    Z --> O
+    O --> T[predictions/*.parquet + run_manifest.json]
+    O -->|--publish-orion| R[Orion: RifiutiDigitalTwin]
+    R -->|subscription| QL[QuantumLeap]
 ```
 
-Esistono due modalità operative:
+QuantumLeap è la sorgente dello storico. La pubblicazione avviene sempre verso
+Orion; QuantumLeap riceve i digital twin tramite una subscription Orion. I file
+di output vengono completati e validati prima dell'eventuale pubblicazione.
 
-1. **Pipeline di addestramento**: legge lo storico, ricostruisce entrambi i
-   modelli e, facoltativamente, pubblica classificazioni e previsioni.
-2. **Servizi ONNX**: usano modelli già esportati. Il servizio di clustering
-   classifica e pubblica le etichette; il servizio di regressione legge le
-   etichette da QuantumLeap, calcola il futuro e aggiorna gli stessi twin.
+## Avvio rapido
 
-I servizi ONNX eseguono solo inferenza: non addestrano e non aggiornano i file
-dei modelli.
+### Ambiente locale
 
-## Prerequisiti FIWARE
+La pipeline usa Python 3.12 nel container. Per un ambiente locale isolato:
 
-Orion e QuantumLeap devono essere raggiungibili. Tutte le richieste devono usare
-gli stessi header tenant:
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r model-training/requirements.txt
+```
+
+`run_pipeline.sh` usa la variabile `PYTHON`; se non è impostata cerca
+`./bin/python`. Negli esempi seguenti:
+
+```bash
+export PYTHON=.venv/bin/python
+```
+
+Per vedere tutte le opzioni senza avviare un training:
+
+```bash
+./run_pipeline.sh --help
+```
+
+### 1. Pipeline legacy da file
+
+```bash
+./run_pipeline.sh \
+  --pipeline legacy \
+  --source file \
+  --anno 2024 \
+  --annual-input data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv \
+  --calendar-input data_csv_parquet/calendario_raccolta.csv \
+  --output-dir artifacts/legacy-file-2024
+```
+
+Il flusso genera una distribuzione giornaliera sintetica a partire dal file
+annuale e dal calendario, quindi addestra il regressore scelto. SGD è il
+regressore predefinito.
+
+### 2. Pipeline legacy da QuantumLeap
+
+```bash
+./run_pipeline.sh \
+  --pipeline legacy \
+  --source quantumleap \
+  --from-date 2024-01-01 \
+  --to-date 2024-12-31 \
+  --output-dir artifacts/legacy-ql-2024
+```
+
+Lo storico giornaliero viene letto da QuantumLeap, aggregato per addestrare
+K-means e poi classificato prima della regressione.
+
+### 3. Pipeline zona/frazione da file
+
+```bash
+./run_pipeline.sh \
+  --pipeline zone-fraction \
+  --source file \
+  --anno 2024 \
+  --annual-input data_csv_parquet/andria_distribuzione_annuale_completa.parquet \
+  --production-input data_csv_parquet/produzione_giornaliera_completa.parquet \
+  --collections-input data_csv_parquet/conferimenti_giornalieri_completi.parquet \
+  --calendar-input data_csv_parquet/calendario_raccolta.csv \
+  --output-dir artifacts/zone-fraction-file-2024
+```
+
+`--output-dir` è obbligatorio per questa pipeline.
+
+### 4. Pipeline zona/frazione da QuantumLeap
+
+```bash
+./run_pipeline.sh \
+  --pipeline zone-fraction \
+  --source quantumleap \
+  --ql-collections-only \
+  --from-date 2024-01-01 \
+  --to-date 2024-12-31 \
+  --calendar-input data_csv_parquet/calendario_raccolta.csv \
+  --output-dir artifacts/zone-fraction-ql-2024
+```
+
+Con `--ql-collections-only`, questa modalità usa il solo storico dei
+conferimenti e non richiede `produzione_teorica_t`, `conferimento_data` o
+`raccolta_prevista`. Senza il flag resta attiva la validazione completa della
+produzione teorica. Entrambe le modalità richiedono uno storico relativo a un
+singolo anno.
+Materializza in `artifacts/zone-fraction-ql-2024/inputs/` lo storico giornaliero
+e gli snapshot usati dalla modalità file:
 
 ```text
-Fiware-Service: openiot
-Fiware-ServicePath: /
+inputs/
+├── quantumleap_daily.parquet
+├── annual.parquet
+└── collections.parquet
 ```
 
-Servono due subscription permanenti:
+`production.parquet` viene aggiunto solo quando il flag non è presente.
 
-- `RifiutiConferimento`, per salvare in QuantumLeap i dati pubblicati dagli
-  utenti;
-- `RifiutiDigitalTwin`, per salvare classificazioni e previsioni.
+## Previsioni future e pubblicazione
 
-Esempio per la prima subscription:
+Per creare un file futuro senza pubblicare nulla:
 
 ```bash
-curl -i -X POST http://localhost:1026/v2/subscriptions \
-  -H 'Content-Type: application/json' \
-  -H 'Fiware-Service: openiot' \
-  -H 'Fiware-ServicePath: /' \
-  -d '{
-    "description": "Storico conferimenti in QuantumLeap",
-    "subject": {
-      "entities": [{
-        "idPattern": ".*",
-        "type": "RifiutiConferimento"
-      }]
-    },
-    "notification": {
-      "http": {
-        "url": "http://fiware-quantumleap:8668/v2/notify"
-      }
-    }
-  }'
+./run_pipeline.sh \
+  --pipeline zone-fraction \
+  --source file \
+  --anno 2024 \
+  --forecast-from-date 2025-01-01 \
+  --forecast-to-date 2025-12-31 \
+  --forecast-calendar data_csv_parquet/calendario_raccolta.csv \
+  --output-dir artifacts/zone-fraction-forecast-2025
 ```
 
-Creare la seconda subscription con lo stesso comando, sostituendo tipo e
-descrizione con `RifiutiDigitalTwin`. L'URL di notifica deve essere raggiungibile
-dal container Orion: `localhost` indicherebbe Orion stesso, non QuantumLeap.
+La pipeline `zone-fraction` include automaticamente il confronto
+SARIMA/SARIMAX quando è richiesto un forecast. Per ogni frazione sceglie il
+metodo usando, nell'ordine, WAPE di validation, RMSE e nome del modello. Il test
+non partecipa alla selezione.
 
-Il progetto non crea automaticamente subscription permanenti.
-
-Per creare soltanto le subscription mancanti:
+Per pubblicare lo stesso risultato in Orion, aggiungere `--publish-orion`:
 
 ```bash
-python manage_fiware_subscriptions.py
+./run_pipeline.sh \
+  --pipeline zone-fraction \
+  --source quantumleap \
+  --from-date 2024-01-01 \
+  --to-date 2024-12-31 \
+  --calendar-input data_csv_parquet/calendario_raccolta.csv \
+  --forecast-from-date 2025-01-01 \
+  --forecast-to-date 2025-12-31 \
+  --publish-orion \
+  --output-dir artifacts/zone-fraction-ql-2024
 ```
 
-Per rimuovere le subscription dei due tipi dirette allo stesso URL QuantumLeap:
+Regole comuni:
 
-```bash
-python manage_fiware_subscriptions.py --remove
+- `--forecast-from-date` e `--forecast-to-date` devono essere presenti insieme;
+- l'intervallo futuro deve iniziare dopo lo storico di training;
+- `--publish-orion` richiede sempre l'intervallo futuro;
+- `--publish-orion` funziona con entrambe le sorgenti;
+- ARIMA della pipeline `legacy` produce solo file batch e non può essere
+  pubblicato;
+- il calendario passato con `--forecast-calendar` può essere diverso da quello
+  di training.
+
+Le date di training senza orario coprono l'intera giornata UTC:
+`2024-01-01` diventa `2024-01-01T00:00:00Z` e `2024-12-31` diventa
+`2024-12-31T23:59:59Z`. Se viene indicato un orario, il fuso è obbligatorio.
+
+## Contratto degli input
+
+### File legacy
+
+L'input annuale predefinito è:
+
+```text
+data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv
 ```
 
-URL e tenant possono essere modificati con `--orion-url`, `--notify-url`,
-`--service` e `--service-path` oppure tramite le variabili d'ambiente
-`ORION_URL`, `QL_NOTIFY_URL`, `FIWARE_SERVICE` e `FIWARE_SERVICE_PATH`.
+Deve contenere almeno:
 
-## Schema dei dati sorgente
+- `id_civico`;
+- `anno` oppure `anno_produzione`;
+- `zona_raccolta`;
+- una colonna `<frazione>_t` per ogni frazione disponibile;
+- le feature anagrafiche usate da K-means, come coordinate e densità.
+
+Il totale `totale_t` è riconosciuto ma non viene usato come frazione.
+
+### File zona/frazione
+
+La pipeline usa quattro file:
+
+| Input | Contenuto principale |
+| --- | --- |
+| `--annual-input` | Una riga per civico, anno, zona, quantità annuali per frazione e campi di qualità territoriale |
+| `--production-input` | Produzione teorica giornaliera, data di conferimento e indicatore di raccolta prevista |
+| `--collections-input` | Conferimenti osservati per civico, data e frazione |
+| `--calendar-input` | Regole o date di raccolta per zona e frazione |
+
+I percorsi predefiniti sono:
+
+```text
+data_csv_parquet/andria_distribuzione_annuale_completa.parquet
+data_csv_parquet/produzione_giornaliera_completa.parquet
+data_csv_parquet/conferimenti_giornalieri_completi.parquet
+data_csv_parquet/calendario_raccolta.csv
+```
+
+La preparazione controlla chiavi, date, quantità non negative, coerenza tra
+totali annuali e frazioni, calendario e riconciliazione fra produzione e
+conferimenti. `cluster_label` viene calcolato dal K-means corrente e unito ai
+conferimenti: non deve essere preparato manualmente nell'input.
+
+### QuantumLeap
 
 Ogni entità `RifiutiConferimento` rappresenta una frazione associata a un
 civico. L'entity ID è opaco; un formato possibile è `2231596:vetro`.
 
-Attributi richiesti:
+La pipeline legacy richiede questi attributi:
 
 | Attributo | Tipo atteso | Significato |
 | --- | --- | --- |
-| `id_civico` | Integer o Text | Identificatore del civico; internamente viene normalizzato come testo |
-| `frazione` | Text | Nome della frazione |
+| `id_civico` | Integer o Text | Identificatore, normalizzato internamente come testo |
+| `frazione` | Text | Frazione del rifiuto |
 | `anno_produzione` | Integer | Anno di riferimento |
-| `coord_x`, `coord_y` | Number | Coordinate del civico |
+| `coord_x`, `coord_y` | Number | Coordinate |
 | `densita_locale` | Number | Densità locale |
-| `zona_raccolta` | Integer o Text | Zona da 1 a 4 |
+| `zona_raccolta` | Integer o Text | Zona operativa |
 | `zona_costruzione` | Text | Categoria urbanistica |
 | `giorni_accumulati` | Number | Giorni confluiti nel conferimento |
-| `conferimento_t` | Number | Quantità in tonnellate |
+| `conferimento_t` | Number | Quantità osservata in tonnellate |
+
+La pipeline `zone-fraction` richiede inoltre:
+
+| Attributo | Significato |
+| --- | --- |
+| `produzione_teorica_t` | Produzione teorica giornaliera |
+| `conferimento_data` | Data a cui è assegnata la produzione |
+| `raccolta_prevista` | Indicatore `0` o `1` |
+| `prg_error` | Informazione di qualità PRG |
+| `zona_raccolta_inferita` | Indicatore di zona inferita |
+| `zona_costruzione_riassegnata` | Indicatore di riassegnazione |
+| `distanza_inferenza_zona_raccolta_gradi` | Distanza usata nell'inferenza |
+| `distanza_riassegnazione_prg` | Distanza usata nella riassegnazione |
+
+La lettura fallisce in modo esplicito in presenza di attributi mancanti,
+frazioni sconosciute, valori nulli o negativi, serie temporali non allineate o
+campi statici in conflitto nello stesso civico/anno.
 
 Frazioni riconosciute:
 
@@ -126,329 +298,218 @@ legno, metallo, plastica, pulizia_stradale_recupero, raee,
 rifiuti_cd, selettiva, tessili, vetro
 ```
 
-Gli attributi richiesti devono essere presenti e allineati nello storico
-QuantumLeap. La pipeline rifiuta frazioni sconosciute, valori nulli, array
-temporali non allineati e conflitti nei campi statici dello stesso civico/anno.
+`--ql-id-pattern` limita gli entity ID letti. Va usato solo se il filtro include
+tutte le entità-frazione necessarie a calcolare totali annuali corretti.
 
-## Pipeline di addestramento
+### Calendario
 
-Il comando principale è:
+Il CSV deve contenere `zona_raccolta`, `frazione` e uno tra:
 
-```bash
-./run_pipeline.sh
+- `weekday`, per una regola settimanale;
+- `data`, per una data esplicita.
+
+La colonna opzionale `raccolta` può disattivare una riga. Per
+`zone-fraction`, il comportamento predefinito è
+`--missing-calendar-mode error`: ogni coppia zona/frazione attiva deve essere
+coperta. `--missing-calendar-mode daily` crea una raccolta giornaliera per le
+coppie mancanti.
+
+## Contratto degli output
+
+Usare sempre `--output-dir` è consigliato, anche se è obbligatorio solo per
+`zone-fraction`. In questo modo ogni esecuzione resta isolata:
+
+```text
+artifacts/<run>/
+├── data/ o data_csv_parquet/    # dati derivati
+├── inputs/                      # snapshot QL completi, solo zone-fraction/QL
+├── metrics/ o *.csv             # metriche native
+├── models/                      # modelli addestrati
+├── predictions/
+│   ├── test.parquet             # output comune, sempre presente
+│   ├── future.parquet           # output comune, se richiesto
+│   └── ...                      # output diagnostici nativi
+└── run_manifest.json            # provenienza e hash degli artifact
 ```
 
-### Benchmark sui Parquet completi
+`predictions/test.parquet` e `predictions/future.parquet` hanno le stesse
+colonne per entrambe le pipeline:
 
-Il nuovo flusso batch per ritiro programmato usa direttamente i tre Parquet
-completi. Prima della regressione addestra K-means sui dati annuali dei civici
-e aggiunge `cluster_label` a ogni riga del Parquet dei conferimenti:
+| Colonna | Significato |
+| --- | --- |
+| `id_civico` | Civico; può essere nullo per output nativi aggregati |
+| `data` | Data della previsione |
+| `frazione` | Frazione |
+| `prediction_t` | Previsione puntuale in tonnellate |
+| `prediction_lower_t`, `prediction_upper_t` | Intervallo, se disponibile |
+| `pipeline` | `legacy` oppure `zone-fraction` |
+| `model` | Modello selezionato |
+| `forecast_method` | Metodo realmente usato, incluso un eventuale fallback |
+| `zona_raccolta` | Zona, se disponibile |
+| `cluster_label` | Cluster, se disponibile |
+
+`run_manifest.json` registra pipeline, sorgente, policy di selezione, input,
+output, artifact e relativi SHA-256. Gli output specifici dei singoli modelli
+restano disponibili per analisi e debug.
+
+Il runner implementa un DAG basato su file: salta un nodo quando tutti i suoi
+output sono più recenti degli input. Per ignorare la cache:
+
+```bash
+./run_pipeline.sh ... --force
+```
+
+Per ispezionare il grafo o i comandi senza eseguirli:
+
+```bash
+./run_pipeline.sh ... --print-graph
+./run_pipeline.sh ... --dry-run
+```
+
+## Come funzionano i modelli
+
+### Pipeline legacy
+
+Il flusso è:
+
+```text
+storico annuale o giornaliero
+→ aggregazione annuale
+→ K-means per civico
+→ righe giornaliere con cluster_label
+→ regressore per frazione/cluster
+→ test e forecast
+```
+
+Con `--source file`, le righe giornaliere sono generate dal totale annuale e
+dal calendario. Con `--source quantumleap`, sono usate le osservazioni reali.
+
+Regressori disponibili:
+
+| `--regressor` | Uso |
+| --- | --- |
+| `sgd` | Default, lineare e scalabile |
+| `gpr` | Gaussian Process esatto; campiona al massimo 500 righe per gruppo per default |
+| `hist_gradient_boosting` | Modello non lineare su tutte le righe del gruppo |
+| `arima` | Serie SARIMA giornaliere, solo output batch |
+
+Esempi:
 
 ```bash
 ./run_pipeline.sh \
-  --source complete-parquet \
-  --output-dir artifacts/zone-fraction-seed42
+  --pipeline legacy \
+  --source file \
+  --regressor gpr \
+  --gpr-max-train-rows 500 \
+  --output-dir artifacts/legacy-gpr
 ```
-
-I percorsi predefiniti sono
-`andria_distribuzione_annuale_completa.parquet`,
-`produzione_giornaliera_completa.parquet` e
-`conferimenti_giornalieri_completi.parquet` nella directory
-`data_csv_parquet`. Possono essere sostituiti con `--annual-input`,
-`--production-input` e `--collections-input`.
-
-La preparazione proietta e aggrega i Parquet con DuckDB per
-zona/frazione/cluster, riconcilia produzione, conferimenti e totali annuali,
-completa i ritiri a zero dal calendario e mantiene lo spillover. Il training si
-ferma al 31 dicembre e usa lo split cronologico gennaio-settembre,
-ottobre-novembre e dicembre; confronta baseline, Ridge, il regressore lineare
-SGD del flusso precedente e histogram gradient boosting, e produce anche i
-quantili 0,50 e 0,90 per le frazioni episodiche.
-`cluster_label` è una feature categorica del modello tabellare e identifica le
-serie usate da Ridge, SGD e histogram gradient boosting. SARIMA e SARIMAX
-aggregano invece i cluster e addestrano una serie per coppia zona/frazione.
-
-Per selezionare il modello con cross-validation temporale a finestra crescente,
-lasciando dicembre come test finale:
 
 ```bash
 ./run_pipeline.sh \
-  --source complete-parquet \
+  --pipeline legacy \
+  --source file \
+  --regressor hist_gradient_boosting \
+  --output-dir artifacts/legacy-hgb
+```
+
+ARIMA può produrre una riga per gruppo:
+
+```bash
+./run_pipeline.sh \
+  --pipeline legacy \
+  --source file \
+  --regressor arima \
+  --arima-group-level \
+  --forecast-from-date 2025-01-01 \
+  --forecast-to-date 2025-12-31 \
+  --output-dir artifacts/legacy-arima
+```
+
+Senza `--arima-group-level`, i totali vengono ripartiti sui civici e il
+calendario futuro è obbligatorio. Con `--arima-group-level --arima-group-by
+zone`, le serie sono raggruppate per zona invece che per cluster.
+
+Le feature legacy includono dati anagrafici e di calendario, quantità storiche
+annuali e medie per raccolta, più lag per civico/frazione. Validation, test e
+forecast aggiornano i lag ricorsivamente senza leggere target futuri.
+
+### Pipeline zona/frazione
+
+Il flusso è:
+
+```text
+dati annuali + produzione + conferimenti + calendario
+→ K-means e classificazione dei conferimenti
+→ ritiri zona/frazione/cluster
+→ feature temporali senza leakage
+→ confronto dei modelli
+→ selezione su validation
+→ ripartizione sui civici
+```
+
+Lo split predefinito usa gennaio-settembre per il training,
+ottobre-novembre per la validation e dicembre per il test. In alternativa:
+
+```bash
+./run_pipeline.sh \
+  --pipeline zone-fraction \
+  --source file \
   --validation-strategy k-fold \
   --validation-folds 5 \
-  --output-dir artifacts/zone-fraction-seed42
+  --output-dir artifacts/zone-fraction-kfold
 ```
 
-La strategia predefinita resta `fixed`, con ottobre-novembre come intervallo di
-validation. `--validation-folds` viene usato soltanto dalla strategia `k-fold`.
+Il benchmark tabellare confronta:
 
-Per escludere completamente le frazioni episodiche da training, selezione,
-metriche e predizioni:
+- ultimo ritiro, media mobile degli ultimi quattro ritiri e media del training;
+- Ridge;
+- SGD;
+- histogram gradient boosting;
+- quantili 0,50 e 0,90 per le frazioni episodiche.
+
+Le feature comprendono calendario e festività italiane, intervallo dal ritiro
+precedente, valore a sette giorni e statistiche dei ritiri precedenti. Tutte le
+finestre escludono il target corrente. `cluster_label` è una feature dei
+modelli tabellari.
+
+Con `--include-arima` vengono confrontati anche SARIMA, SARIMAX e naive
+stagionale a sette giorni. Questi modelli lavorano per zona/frazione e non
+usano il cluster. I giorni non programmati restano osservazioni mancanti,
+mentre SARIMAX usa intervallo dal ritiro precedente e festività come regressori
+noti.
 
 ```bash
 ./run_pipeline.sh \
-  --source complete-parquet \
-  --exclude-episodic-fractions \
-  --output-dir artifacts/zone-fraction-seed42
-```
-
-Le feature storiche comprendono il ritiro precedente, il valore osservato
-esattamente sette giorni prima, le statistiche degli ultimi quattro ritiri e
-media, somma e conteggio dei ritiri nei sette giorni precedenti. Tutte le
-finestre escludono il target corrente.
-
-La loss HGB predefinita è `poisson`. Per un confronto esplicito:
-
-```bash
-./run_pipeline.sh \
-  --source complete-parquet \
-  --hgb-loss squared_error \
-  --output-dir artifacts/zone-fraction-squared-error
-```
-
-Per eseguire anche il confronto SARIMA/SARIMAX per zona e frazione:
-
-```bash
-./run_pipeline.sh \
-  --source complete-parquet \
-  --exclude-episodic-fractions \
-  --include-arima \
-  --output-dir artifacts/zone-fraction-seed42
-```
-
-SARIMA usa una frequenza giornaliera e stagionalità settimanale, ma mantiene i
-giorni non programmati come osservazioni mancanti invece di trasformarli in
-target zero. SARIMAX viene selezionato e valutato in parallelo, usando come
-regressori noti l'intervallo dal ritiro programmato precedente e le festività
-nazionali italiane (con il giorno successivo); le festività non modificano il
-calendario di raccolta. Ordine e ordine stagionale vengono scelti sul WAPE di
-validation; il test viene confrontato anche con il valore osservato sette
-giorni prima.
-Anche il sottocomando `arima` accetta `--validation-strategy k-fold` e
-`--validation-folds`; in questa modalità seleziona gli ordini sul WAPE medio
-dei fold temporali.
-
-I totali di test di SARIMA, SARIMAX e della baseline stagionale vengono inoltre
-ripartiti su tutti i civici della stessa zona. I pesi
-sono calcolati esclusivamente dai conferimenti precedenti al 1 dicembre; i
-civici senza storico ricevono peso zero e, se tutto il gruppo è privo di
-storico, vengono usate quote uguali. Il riepilogo stampa il WAPE aggregato,
-quello per civico e il relativo incremento.
-
-Per le frazioni incluse, la ripartizione confronta il peso storico con un
-`BayesianRidge` e un modello empirico-Bayes Dirichlet. La selezione usa
-ottobre-novembre, richiede prima una copertura almeno del 90% e poi minimizza
-il WAPE civico. Le previsioni di dicembre includono gli estremi inferiore e
-superiore; ogni previsione puntuale continua a sommare esattamente al totale
-zona/frazione. Il benchmark non usa produzione o conferimenti futuri e non usa
-`cluster_label`, perché deriva dai totali annuali completi.
-
-Gli output principali sono:
-
-```text
-artifacts/zone-fraction-seed42/
-├── data/kmeans_assignments.parquet
-├── data/conferimenti_giornalieri_classificati.parquet
-├── data/static_civics.parquet
-├── data/withdrawals/scenario_seed=42/part-000.parquet
-├── manifest.json
-├── models/kmeans_model.joblib
-├── metrics/zone_fraction_benchmark_metrics.csv
-├── metrics/zone_fraction_arima_civic_metrics.csv
-├── metrics/zone_fraction_arima_allocator_benchmark.csv
-├── models/zone_fraction_benchmark.joblib
-├── predictions/zone_fraction_test_predictions.parquet
-└── predictions/zone_fraction_arima_test_predictions_per_civic.parquet
-```
-
-Il flusso corrente dichiara `scenario_seed=42`; il seed non viene usato come
-feature. `--missing-calendar-mode error` è il comportamento predefinito e può
-essere sostituito esplicitamente con `daily`.
-
-La sorgente predefinita è il file locale. Il flusso eseguito è:
-
-```text
-CSV annuale → K-means → distribuzione giornaliera sintetica
-             → regressore raggruppato SGD, GPR, histogram gradient boosting o ARIMA
-```
-
-La distribuzione giornaliera aggiunge anche `historical_annual_t` e
-`historical_collection_mean_t`. Per le previsioni future rappresentano
-rispettivamente l'ultima quantità annua osservata per civico/frazione e la sua
-media per raccolta pianificata.
-
-Il regressore calcola inoltre, senza pubblicarli, i lag per civico/frazione:
-ultimo conferimento, somme dei 7 e 30 giorni precedenti, mediana e conteggio
-dei 90 giorni precedenti e giorni dall'ultimo conferimento positivo. Validation,
-test e forecast aggiornano questi lag ricorsivamente con le previsioni, senza
-leggere target futuri.
-
-Il runner salta gli step i cui output sono già più recenti degli input. Per
-rieseguirli:
-
-```bash
-./run_pipeline.sh --force
-```
-
-Per provare un nuovo addestramento senza sovrascrivere modelli, metriche e dati
-generati già in uso, indicare una directory isolata:
-
-```bash
-./run_pipeline.sh --source quantumleap \
-  --from-date 2024-01-01T00:00:00Z \
-  --to-date 2024-12-31T23:59:59Z \
-  --output-dir artifacts/prova-2024
-```
-
-SGD resta il regressore predefinito. Per addestrare invece i 72
-`GaussianProcessRegressor` raggruppati per frazione e cluster:
-
-```bash
-./run_pipeline.sh --regressor gpr \
-  --gpr-max-train-rows 500 \
-  --output-dir artifacts/gpr-2024 \
-  --force
-```
-
-GPR esatto non scala a milioni di righe per gruppo. La pipeline divide quindi
-cronologicamente il train set di ogni gruppo in un massimo di 500 intervalli e
-sceglie una riga deterministica per intervallo. Il limite è configurabile; le
-metriche e le previsioni continuano a essere calcolate sugli split completi.
-
-Per addestrare un `HistGradientBoostingRegressor` su tutte le righe di ogni
-gruppo, con loss Poisson e valutazione cronologica ricorsiva:
-
-```bash
-./run_pipeline.sh \
+  --pipeline zone-fraction \
   --source file \
-  --anno 2024 \
-  --regressor hist_gradient_boosting \
-  --output-dir artifacts/hist-gradient-boosting-2024 \
-  --force
+  --include-arima \
+  --output-dir artifacts/zone-fraction-arima
 ```
 
-I 72 gruppi vengono elaborati in sequenza, quindi in memoria viene caricato un
-solo gruppo alla volta. A differenza di GPR, questo modello non applica un limite
-al numero di righe di training.
+La ripartizione del totale zona/frazione sui civici confronta quote storiche,
+Bayesian Ridge ed empirical-Bayes Dirichlet. La scelta usa la validation,
+richiede prima copertura sufficiente e poi minimizza il WAPE civico. La somma
+delle previsioni civiche conserva il totale del gruppo.
 
-Per addestrare invece 72 serie giornaliere SARIMA, una per coppia
-`frazione`/`cluster_label`, e produrre previsioni future per civico:
+Opzioni utili:
 
-```bash
-./run_pipeline.sh \
-  --regressor arima \
-  --arima-group-level \
-  --forecast-from-date 2025-01-07 \
-  --forecast-to-date 2025-12-31 \
-  --output-dir artifacts/arima-2024 \
-  --force
-```
+| Opzione | Effetto |
+| --- | --- |
+| `--exclude-episodic-fractions` | Esclude frazioni episodiche da training, metriche e output |
+| `--hgb-loss poisson` | Loss HGB predefinita |
+| `--hgb-loss squared_error` | Confronto HGB con errore quadratico |
+| `--include-arima` | Aggiunge SARIMA/SARIMAX; implicito per i forecast futuri |
+| `--validation-strategy k-fold` | Usa finestre temporali crescenti |
 
-La pipeline somma i conferimenti di ogni gruppo su un calendario giornaliero,
-riempie con zero i giorni mancanti e confronta modelli con stagionalità
-settimanale su tre finestre di validation espandibili. Per ogni gruppo seleziona
-il SARIMA con RMSE medio più basso e riporta anche il benchmark stagionale
-naive `y[t-7]`; il test finale resta separato dalla selezione. Con
-`--arima-group-level` il processo si ferma qui e
-scrive una riga per data, frazione e cluster, senza richiedere un calendario di
-raccolta. Senza il flag, ogni totale viene invece ripartito tra i civici in
-raccolta quel giorno in proporzione alla quantità annua storica della frazione;
-in questo caso `--forecast-calendar` è obbligatorio per le previsioni future.
-Se un SARIMA diventa numericamente non finito su un lungo orizzonte futuro,
-quel gruppo usa il benchmark settimanale e lo segnala in `forecast_method`.
-ARIMA è disponibile soltanto come output batch: non viene esportato in ONNX né
-pubblicato in Orion.
+## Training API
 
-Per prevedere invece i conferimenti secondo la loro unità operativa naturale,
-si possono addestrare 48 serie `frazione`/`zona_raccolta` usando il calendario
-originale del gestore:
-
-```bash
-./run_pipeline.sh \
-  --regressor arima \
-  --arima-group-level \
-  --arima-group-by zone \
-  --calendar-input data_csv_parquet/calendario_raccolta.csv \
-  --forecast-from-date 2025-01-07 \
-  --forecast-to-date 2025-12-31 \
-  --output-dir artifacts/arima-zone-2024 \
-  --force
-```
-
-Questa modalità mantiene separati modello, metriche e previsioni tramite nomi
-di artifact con suffisso `zone_level` o `by_zone`.
-
-`--output-dir` mantiene al suo interno la stessa struttura standard:
-
-```text
-artifacts/prova-2024/
-├── data_csv_parquet/     # output derivati della modalità file
-├── models/               # classificatore e regressore
-├── predictions/          # previsioni del test set
-└── grouped_<regressor>_time_series_metrics.csv
-```
-
-Gli input sorgente non vengono copiati o modificati. Gli snapshot QuantumLeap
-restano temporanei. Il flag isola soltanto i file locali: se viene aggiunto
-anche `--publish-orion`, i digital twin vengono comunque pubblicati in Orion.
-
-### Esecuzione in container
-
-Creare l'immagine della pipeline:
-
-```bash
-docker build -f model-training/Dockerfile -t waste-model-training .
-```
-
-I dati sorgente e gli artefatti non sono inclusi nell'immagine. Per addestrare
-da file locali, montare i dati in sola lettura e una directory separata per gli
-output:
-
-```bash
-mkdir -p artifacts/container-file
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -v "$PWD/data_csv_parquet:/app/data_csv_parquet:ro" \
-  -v "$PWD/artifacts/container-file:/artifacts" \
-  waste-model-training \
-  --source file --output-dir /artifacts --force
-```
-
-Per addestrare da QuantumLeap, collegare il job alla rete FIWARE e fornire gli
-stessi parametri del runner locale:
-
-```bash
-mkdir -p artifacts/container-quantumleap
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  --network fiware-quantumleap_fiware \
-  -e QL_URL=http://fiware-quantumleap:8668 \
-  -e FIWARE_SERVICE=openiot \
-  -e FIWARE_SERVICE_PATH=/ \
-  -v "$PWD/artifacts/container-quantumleap:/artifacts" \
-  waste-model-training \
-  --source quantumleap \
-  --from-date 2024-01-01 \
-  --to-date 2024-12-31 \
-  --output-dir /artifacts
-```
-
-Tutte le opzioni mostrate da `./run_pipeline.sh --help`, incluse quelle per la
-pubblicazione Orion, possono essere aggiunte dopo il nome dell'immagine. Su
-Linux, `--user` fa sì che gli artefatti nei bind mount appartengano all'utente
-che avvia il container; senza override l'immagine usa l'utente non privilegiato
-`app` (UID 10001).
-
-### API di addestramento on demand
-
-Il target `api` della stessa immagine espone la pipeline tramite FastAPI senza
-modificare il comportamento predefinito dell'immagine batch:
+La stessa pipeline è esposta da FastAPI. Creare e avviare l'immagine:
 
 ```bash
 docker build --target api -f model-training/Dockerfile \
   -t waste-model-training-api .
 
-mkdir -p "$PWD/artifacts"
+mkdir -p artifacts
 docker run --rm \
   --name waste-model-training-api \
   --user "$(id -u):$(id -g)" \
@@ -463,149 +524,148 @@ docker run --rm \
   waste-model-training-api
 ```
 
-Avviare un job usando file locali al nodo/container:
+Esempio `zone-fraction` da file:
 
 ```bash
 curl -X POST http://localhost:8002/v1/training-jobs \
   -H 'Content-Type: application/json' \
   -d '{
+    "pipeline": "zone-fraction",
     "source": "file",
     "year": 2024,
-    "seed": 42,
-    "regressor": "gpr",
-    "gpr_max_train_rows": 500,
-    "annual_input_path": "/data/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+    "annual_input_path": "/data/andria_distribuzione_annuale_completa.parquet",
+    "production_input_path": "/data/produzione_giornaliera_completa.parquet",
+    "collections_input_path": "/data/conferimenti_giornalieri_completi.parquet",
     "calendar_input_path": "/data/calendario_raccolta.csv",
-    "output_dir": "/artifacts/file-2024",
-    "force": false
-  }'
-```
-
-Per un job ARIMA aggregato, impostare `"regressor": "arima"`, aggiungere
-`"arima_group_level": true` e il blocco opzionale `forecast`; senza questo
-blocco viene omesso soltanto il file futuro:
-
-```json
-"forecast": {
-  "forecast_from_date": "2025-01-07",
-  "forecast_to_date": "2025-12-31"
-}
-```
-
-Oppure leggere lo storico da QuantumLeap e, facoltativamente, pubblicare i
-digital twin in Orion:
-
-```bash
-curl -X POST http://localhost:8002/v1/training-jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "source": "quantumleap",
-    "seed": 42,
-    "from_date": "2024-01-01",
-    "to_date": "2024-12-31",
-    "output_dir": "/artifacts/quantumleap-2024",
-    "orion": {
+    "output_dir": "/artifacts/zone-fraction-file-2024",
+    "forecast": {
       "forecast_from_date": "2025-01-01",
-      "forecast_to_date": "2025-12-31",
-      "forecast_calendar_path": "/data/calendario_raccolta.csv"
+      "forecast_to_date": "2025-12-31"
     }
   }'
 ```
 
-La risposta `202 Accepted` contiene `job_id`. Consultare lo stato con:
+Esempio `zone-fraction` da QuantumLeap con pubblicazione:
+
+```bash
+curl -X POST http://localhost:8002/v1/training-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pipeline": "zone-fraction",
+    "source": "quantumleap",
+    "from_date": "2024-01-01",
+    "to_date": "2024-12-31",
+    "calendar_input_path": "/data/calendario_raccolta.csv",
+    "output_dir": "/artifacts/zone-fraction-ql-2024",
+    "orion": {
+      "forecast_from_date": "2025-01-01",
+      "forecast_to_date": "2025-12-31"
+    }
+  }'
+```
+
+Usare `forecast` per creare solo i file e `orion` per creare i file e
+pubblicarli. I due blocchi sono mutuamente esclusivi.
+
+Per usare la pipeline legacy nell'API, impostare `"pipeline": "legacy"`. Una
+richiesta da file richiede solo input annuale e calendario; una richiesta da
+QuantumLeap usa il contratto di attributi legacy descritto sopra.
+
+La risposta `202 Accepted` contiene `job_id`. Stato e salute:
 
 ```bash
 curl http://localhost:8002/v1/training-jobs/JOB_ID
 curl http://localhost:8002/healthz
 ```
 
-Gli stati sono `queued`, `running`, `succeeded` e `failed`. Il servizio accetta
-un solo job attivo e risponde `409` alle richieste concorrenti. Gli ID e gli
-stati restano in memoria e vengono persi al riavvio. I percorsi relativi sono
-risolti rispetto alla radice del progetto; i percorsi assoluti sono limitati
-dai permessi del processo e dai mount del container. Il servizio verifica che
-`output_dir` sia creabile e scrivibile prima di accettare il job.
+Gli stati sono `queued`, `running`, `succeeded` e `failed`. Il processo accetta
+un solo job attivo e risponde `409` alle richieste concorrenti. Stato e ID
+restano in memoria e vengono persi al riavvio.
 
-### Addestramento da QuantumLeap
+## Esecuzione batch in container
+
+Creare l'immagine:
 
 ```bash
-./run_pipeline.sh --source quantumleap \
-  --from-date 2024-01-01 \
-  --to-date 2024-12-31
+docker build -f model-training/Dockerfile -t waste-model-training .
 ```
 
-Le date senza orario indicano l'intera giornata in UTC: la data iniziale viene
-convertita in `00:00:00Z` e quella finale in `23:59:59Z`. Se si specifica anche
-l'orario, il fuso orario è obbligatorio, per esempio
-`2024-01-01T00:00:00+01:00` oppure `2024-01-01T00:00:00Z`.
+Da file:
 
-Il flusso QuantumLeap è:
+```bash
+mkdir -p artifacts/container-file
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/data_csv_parquet:/app/data_csv_parquet:ro" \
+  -v "$PWD/artifacts/container-file:/artifacts" \
+  waste-model-training \
+  --pipeline zone-fraction \
+  --source file \
+  --output-dir /artifacts
+```
+
+Da QuantumLeap:
+
+```bash
+mkdir -p artifacts/container-ql
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --network fiware-quantumleap_fiware \
+  -e QL_URL=http://fiware-quantumleap:8668 \
+  -e FIWARE_SERVICE=openiot \
+  -e FIWARE_SERVICE_PATH=/ \
+  -v "$PWD/data_csv_parquet/calendario_raccolta.csv:/data/calendar.csv:ro" \
+  -v "$PWD/artifacts/container-ql:/artifacts" \
+  waste-model-training \
+  --pipeline zone-fraction \
+  --source quantumleap \
+  --from-date 2024-01-01 \
+  --to-date 2024-12-31 \
+  --calendar-input /data/calendar.csv \
+  --output-dir /artifacts
+```
+
+L'immagine non contiene i dataset sorgente. Su Linux, `--user` assegna gli
+artifact all'utente corrente; senza override viene usato l'utente non
+privilegiato `app` (UID 10001).
+
+## FIWARE e digital twin
+
+Orion e QuantumLeap devono usare gli stessi header tenant:
 
 ```text
-fetch storico
-→ aggregazione delle 13 frazioni per civico/anno
-→ addestramento K-means
-→ classificazione di ogni riga giornaliera
-→ addestramento del regressore selezionato per frazione/cluster
+Fiware-Service: openiot
+Fiware-ServicePath: /
 ```
 
-Le frazioni note assenti vengono valorizzate a zero. Gli snapshot Parquet sono
-temporanei e vengono eliminati al termine. Poiché gli input sono ricreati a ogni
-esecuzione, la modalità QuantumLeap riaddestra entrambi i modelli ogni volta.
+Servono due subscription permanenti:
 
-`--ql-id-pattern` può limitare gli entity ID, ma il pattern deve includere tutte
-le entità-frazione necessarie per ottenere totali annuali corretti.
+- `RifiutiConferimento`, per salvare lo storico sorgente;
+- `RifiutiDigitalTwin`, per salvare classificazioni e previsioni.
 
-### Addestramento e pubblicazione dei twin
+Il progetto non crea automaticamente subscription permanenti. Per creare solo
+quelle mancanti:
 
 ```bash
-./run_pipeline.sh --source quantumleap \
-  --from-date 2024-01-01T00:00:00Z \
-  --to-date 2024-12-31T23:59:59Z \
-  --publish-orion \
-  --forecast-from-date 2025-01-01 \
-  --forecast-to-date 2025-12-31
+python manage_fiware_subscriptions.py
 ```
 
-L'intervallo futuro deve iniziare dopo `--to-date`. La pipeline genera prima
-tutti i twin in uno snapshot temporaneo e pubblica in Orion solo se
-classificazione e regressione terminano correttamente.
-
-Output persistenti principali:
-
-| Output | Contenuto |
-| --- | --- |
-| `models/kmeans_model_annuo_peso_coord.joblib` | Modello K-means |
-| `models/grouped_sgd_time_series.joblib` | Regressori raggruppati |
-| `grouped_sgd_time_series_metrics.csv` | Metriche train/validation/test |
-| `predictions/sgd_test_predictions_grouped.parquet` | Previsioni sul test set |
-| `models/grouped_gpr_time_series.joblib` | Regressori GPR raggruppati, se selezionati |
-| `grouped_gpr_time_series_metrics.csv` | Metriche GPR train/validation/test |
-| `predictions/gpr_test_predictions_grouped.parquet` | Previsioni GPR sul test set |
-| `models/grouped_hist_gradient_boosting_time_series.joblib` | Regressori histogram gradient boosting raggruppati |
-| `grouped_hist_gradient_boosting_time_series_metrics.csv` | Metriche histogram gradient boosting |
-| `predictions/hist_gradient_boosting_test_predictions_grouped.parquet` | Previsioni histogram gradient boosting |
-| `models/grouped_arima_time_series.joblib` | 72 modelli SARIMA giornalieri raggruppati |
-| `grouped_arima_time_series_metrics.csv` | Metriche aggregate e per-civico ARIMA |
-| `predictions/arima_test_predictions_per_civic.parquet` | Previsioni ARIMA per-civico sul test set |
-| `predictions/arima_future_predictions_per_civic.parquet` | Previsioni future per-civico, se richieste |
-| `models/grouped_arima_time_series_group_level.joblib` | Modelli SARIMA salvati dalla modalità aggregata |
-| `grouped_arima_time_series_group_level_metrics.csv` | Metriche aggregate della modalità group-level |
-| `predictions/arima_test_predictions_grouped.parquet` | Totali ARIMA per data/frazione/cluster sul test set |
-| `predictions/arima_future_predictions_grouped.parquet` | Totali ARIMA futuri, con `--arima-group-level` |
-
-Per vedere il grafo senza eseguirlo:
+Per rimuovere le subscription dei due tipi dirette allo stesso QuantumLeap:
 
 ```bash
-./run_pipeline.sh --source quantumleap \
-  --from-date 2024-01-01T00:00:00Z \
-  --to-date 2024-12-31T23:59:59Z \
-  --print-graph
+python manage_fiware_subscriptions.py --remove
 ```
 
-## Digital twin
+URL e tenant del gestore sono configurabili con `--orion-url`, `--notify-url`,
+`--service` e `--service-path`, oppure con `ORION_URL`, `QL_NOTIFY_URL`,
+`FIWARE_SERVICE` e `FIWARE_SERVICE_PATH`.
 
-Viene creata un'entità per civico e anno:
+L'URL di notifica deve essere raggiungibile dal container Orion. Per esempio,
+su una rete Docker può essere
+`http://fiware-quantumleap:8668/v2/notify`; `localhost` indicherebbe Orion
+stesso.
+
+Ogni twin ha ID deterministico:
 
 ```text
 urn:ngsi-v2:RifiutiDigitalTwin:<id_civico>:<anno_previsione>
@@ -633,50 +693,63 @@ Contenuto principale:
 }
 ```
 
-`future_values` contiene solo le date di conferimento previste dal calendario
-`data_csv_parquet/calendario_raccolta.csv`. Una nuova esecuzione aggiorna la
-stessa entità invece di crearne una duplicata.
+Una nuova esecuzione aggiorna il twin dello stesso civico/anno. Le versioni dei
+modelli sono hash SHA-256 degli artifact usati.
 
-## Esportazione ONNX
+## Esportazione e servizi ONNX
 
-Installare le dipendenze degli esportatori nell'ambiente virtuale:
+I servizi supportano sia i modelli `legacy` sia quelli `zone-fraction`.
+L'inferenza tabulare usa ONNX; i modelli SARIMAX `zone-fraction` restano nel
+formato Joblib/Statsmodels nativo.
+
+Installare le dipendenze degli esportatori:
 
 ```bash
-bin/python -m pip install -r onnx_clustering/requirements-export.txt
-bin/python -m pip install -r onnx_inference/requirements-export.txt
+.venv/bin/python -m pip install -r onnx_clustering/requirements-export.txt
+.venv/bin/python -m pip install -r onnx_inference/requirements-export.txt
 ```
 
-Esportare i due pacchetti:
+Esportare classificatore e regressori provenienti dalla stessa esecuzione:
 
 ```bash
-bin/python onnx_clustering/export_model.py \
-  --input models/kmeans_model_annuo_peso_coord.joblib \
+.venv/bin/python onnx_clustering/export_model.py \
+  --input artifacts/legacy-file-2024/models/kmeans_model_annuo_peso_coord.joblib \
   --output-dir .tmp/kmeans-onnx
 
-bin/python onnx_inference/export_models.py \
-  --input models/grouped_sgd_time_series.joblib \
+.venv/bin/python onnx_inference/export_models.py \
+  --input artifacts/legacy-file-2024/models/grouped_sgd_time_series.joblib \
   --output-dir .tmp/grouped-sgd-onnx
 ```
 
-L'esportatore accetta anche i bundle GPR e histogram gradient boosting; il
-servizio di inferenza e la pubblicazione dei twin espongono in ogni caso la sola
-previsione media.
+L'esportatore della regressione accetta anche bundle GPR e histogram gradient
+boosting.
 
-Ogni directory contiene `manifest.json` e i modelli ONNX. Gli esportatori non
-sovrascrivono directory esistenti: usare una nuova directory per ogni versione.
-Classificatore e regressore devono provenire dalla stessa esecuzione di
-addestramento, perché le etichette dei cluster possono cambiare.
+Esportare i modelli `zone-fraction` della stessa esecuzione:
 
-## Avvio dei servizi ONNX
+```bash
+.venv/bin/python onnx_clustering/export_model.py \
+  --input artifacts/zone-fraction/models/kmeans_model.joblib \
+  --output-dir .tmp/zone-fraction-kmeans
 
-Creare le immagini:
+.venv/bin/python onnx_inference/export_models.py \
+  --input artifacts/zone-fraction/models/zone_fraction_benchmark.joblib \
+  --sarimax-input artifacts/zone-fraction/models/zone_fraction_arima.joblib \
+  --output-dir .tmp/zone-fraction-runtime
+```
+
+Il pacchetto di regressione contiene il preprocessore tabulare fitted
+(imputazione, indicatori dei valori mancanti, scaling e codifica), il regressore
+convertito in ONNX e il bundle SARIMAX nativo senza conversione. Il bundle
+SARIMAX può essere molto grande; resta nella directory montata in `/models` e
+non viene incluso nell'immagine Docker. Usare una directory nuova per ogni
+versione.
+
+Creare e avviare i servizi:
 
 ```bash
 docker build -f onnx_clustering/Dockerfile -t waste-onnx-clustering .
 docker build -f onnx_inference/Dockerfile -t waste-onnx-inference .
 ```
-
-Esempio sulla rete Docker locale `fiware-quantumleap_fiware`:
 
 ```bash
 docker run --rm --name waste-clustering \
@@ -700,21 +773,18 @@ docker run --rm --name waste-regression \
   waste-onnx-inference
 ```
 
-Verificare lo stato:
+Verifica:
 
 ```bash
 curl http://localhost:8001/readyz
 curl http://localhost:8000/readyz
 ```
 
-La documentazione interattiva FastAPI è disponibile su `/docs` per entrambi i
-servizi.
+La documentazione interattiva è disponibile su `/docs`.
 
-## Inferenza ONNX da QuantumLeap
+### Inferenza ONNX da QuantumLeap
 
-Il flusso consigliato usa due chiamate esplicite.
-
-### 1. Classificare e pubblicare le etichette
+Prima classificare e pubblicare le etichette:
 
 ```bash
 curl -X POST http://localhost:8001/v1/predict/quantumleap \
@@ -727,15 +797,7 @@ curl -X POST http://localhost:8001/v1/predict/quantumleap \
   }'
 ```
 
-Il servizio legge tutti i record nel periodo, filtra i civici richiesti senza
-perdere le rispettive frazioni, aggrega per anno, esegue K-means e pubblica le
-etichette nei twin Orion. Omettendo `civic_ids` vengono elaborati tutti i civici
-del periodo richiesto. `forecast_year` identifica l'anno del digital twin; le
-date esatte dell'intervallo sono richieste soltanto dalla regressione.
-
-### 2. Calcolare e pubblicare le previsioni
-
-Eseguire questa chiamata dopo la precedente:
+Poi calcolare e pubblicare le previsioni:
 
 ```bash
 curl -X POST http://localhost:8000/v1/forecast/quantumleap \
@@ -749,87 +811,96 @@ curl -X POST http://localhost:8000/v1/forecast/quantumleap \
   }'
 ```
 
-Il regressore legge i dati sorgente e le etichette twin da QuantumLeap. Attende
-brevemente l'eventuale propagazione Orion → QuantumLeap, calcola i conferimenti
-futuri e aggiorna gli stessi twin in Orion.
+Omettendo `civic_ids` vengono elaborati tutti i civici dell'intervallo. Il
+secondo servizio attende brevemente la propagazione Orion → QuantumLeap delle
+etichette prodotte dal primo.
 
-Altri endpoint disponibili:
+Endpoint aggiuntivi:
 
 | Servizio | Endpoint | Uso |
 | --- | --- | --- |
-| Clustering | `POST /v1/predict` | Classificazione diretta di record annuali già preparati |
-| Regressione | `POST /v1/predict` | Regressione diretta di feature già preparate e classificate |
-| Regressione | `POST /v1/predict/quantumleap` | Previsione sulle righe storiche che possiedono già `cluster_label` |
-| Entrambi | `GET /healthz` | Processo attivo |
-| Entrambi | `GET /readyz` | Modello caricato e pronto |
+| Clustering | `POST /v1/predict` | Classifica record annuali già preparati |
+| Regressione | `POST /v1/predict` | Predice feature già preparate |
+| Regressione | `POST /v1/predict/quantumleap` | Usa righe che possiedono già `cluster_label` |
+| Regressione | `POST /v1/predict/zone-fraction` | Predice feature tabulari zona/frazione |
+| Regressione | `POST /v1/forecast/zone-fraction` | Esegue forecast SARIMAX nativo per gruppo |
+| Entrambi | `GET /healthz` | Verifica il processo |
+| Entrambi | `GET /readyz` | Verifica che il modello sia caricato |
 
-Codici di errore principali:
-
-| Codice | Significato |
-| --- | --- |
-| 404 | Nessun dato o nessuna etichetta twin disponibile |
-| 422 | Intervallo non valido, categoria o gruppo modello sconosciuto |
-| 502 | Risposta upstream o dati QuantumLeap malformati |
-| 504 | Timeout QuantumLeap o Orion |
+Il forecast SARIMAX usa il calendario configurato e restituisce totali per
+zona, frazione e cluster. La disaggregazione sui civici continua a richiedere
+gli input storici e statici della pipeline di training.
 
 ## Configurazione
 
-| Variabile | Predefinito | Utilizzata da |
+| Variabile | Default | Utilizzata da |
 | --- | --- | --- |
+| `PYTHON` | `./bin/python` | Runner locale |
 | `QL_URL` | `http://localhost:8668` | Pipeline e servizi |
 | `ENTITY_TYPE` | `RifiutiConferimento` | Pipeline e servizi |
 | `FIWARE_SERVICE` | `openiot` | Pipeline e servizi |
 | `FIWARE_SERVICE_PATH` | `/` | Pipeline e servizi |
 | `QL_TIMEOUT_SECONDS` | `30` | Pipeline e servizi |
 | `ORION_URL` | `http://localhost:1026` | Pipeline e servizi |
+| `QL_NOTIFY_URL` | `http://fiware-quantumleap:8668/v2/notify` | Gestore subscription |
 | `ORION_TIMEOUT_SECONDS` | `30` | Pipeline e servizi |
-| `ORION_TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Pipeline di addestramento |
+| `ORION_TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Training |
 | `TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Servizi ONNX |
-| `ORION_BATCH_SIZE` | `20` | Pipeline di addestramento |
+| `ORION_BATCH_SIZE` | `20` | Training |
 | `QL_LABEL_WAIT_SECONDS` | `5` | Regressore ONNX |
-| `FORECAST_CALENDAR` | calendario incluso | Pipeline e regressore ONNX |
+| `FORECAST_CALENDAR` | calendario incluso | Training e regressore ONNX |
 | `MODEL_DIR` | `/models` | Servizi ONNX |
 
-Le stesse configurazioni della pipeline possono essere fornite tramite opzioni
-`--ql-*`, `--fiware-*` e `--orion-*`. Consultare l'elenco completo con:
+Le configurazioni FIWARE della CLI sono disponibili anche come opzioni
+`--ql-*`, `--fiware-*` e `--orion-*`.
+
+## Test e diagnostica
+
+Suite configurata, senza servizi esterni:
 
 ```bash
-./run_pipeline.sh --help
+.venv/bin/python -m pytest -q
 ```
 
-## Test e verifica
-
-Suite completa senza servizi esterni:
-
-```bash
-bin/python -m pytest -q
-```
-
-Autoverifica del grafo di addestramento:
+Autoverifica del runner:
 
 ```bash
 ./run_pipeline.sh --self-check
 ```
 
-Test di sistema con Orion e QuantumLeap locali:
+Test con Orion e QuantumLeap locali:
 
 ```bash
 RUN_ORION_INTEGRATION=1 \
-  bin/python -m pytest -q test_orion_integration.py
+  .venv/bin/python -m pytest -q test_orion_integration.py
 ```
 
-Il test di sistema crea tipi, entità e subscription temporanei, verifica il
-flusso Orion → QuantumLeap → ONNX clustering → twin → ONNX regressione e infine
-rimuove i dati di test.
+Il test di integrazione crea entità e subscription temporanee, verifica il
+flusso Orion → QuantumLeap → servizi ONNX → digital twin e infine rimuove i
+dati di test.
+
+Errori comuni:
+
+| Errore | Controllo |
+| --- | --- |
+| File non trovato | Verificare il percorso rispetto alla radice del repository o i mount Docker |
+| Calendario incompleto | Aggiungere la coppia zona/frazione o usare consapevolmente `--missing-calendar-mode daily` |
+| Attributi QL mancanti | Usare il profilo completo richiesto da `zone-fraction` |
+| Forecast rifiutato | Controllare che inizi dopo la fine dello storico |
+| Nessun dato QL | Verificare tenant, entity type, intervallo e `--ql-id-pattern` |
+| Twin non visibile in QL | Verificare la subscription `RifiutiDigitalTwin` e l'URL di notifica |
+| Job API in `409` | Attendere la fine del job attivo |
 
 ## Limiti operativi
 
-- Le richieste senza `civic_ids` devono comunque usare periodi temporali
+- Le query QuantumLeap senza filtro civici devono usare intervalli
   ragionevolmente limitati.
-- La pipeline QuantumLeap riaddestra sempre i modelli; non riusa automaticamente
-  un modello esistente.
-- Pubblicare in Orion non avvia automaticamente la pipeline di addestramento.
-- Autenticazione aggiuntiva, retry automatici, creazione delle subscription e
-  deployment automatico dei nuovi modelli sono fuori dal flusso corrente.
-- La pubblicazione dei twin usa upsert deterministici: una riesecuzione aggiorna
-  il twin dello stesso civico/anno.
+- La modalità QuantumLeap riacquisisce lo storico e riaddestra i modelli a ogni
+  esecuzione.
+- La pipeline legacy usa snapshot QuantumLeap temporanei; `zone-fraction` li
+  conserva sotto `output-dir/inputs` per tracciabilità.
+- La pubblicazione in Orion non avvia automaticamente un nuovo training.
+- Retry automatici, autenticazione aggiuntiva, coda durevole dei job e
+  deployment automatico dei modelli non fanno parte del flusso corrente.
+- Gli upsert dei twin sono deterministici: una riesecuzione aggiorna lo stesso
+  civico/anno.
