@@ -1328,8 +1328,11 @@ def test_existing_models_classify_then_regress(tmp_path):
     assert prediction >= 0
 
 
-class FakePackage:
+class FakePackage(RegressionModelPackage):
     model_version = "v1"
+
+    def __init__(self):
+        pass
 
     def predict(self, instances):
         if instances[0].cluster_label == 999:
@@ -1446,9 +1449,12 @@ def test_onnx_regression_reads_twin_label_forecasts_and_publishes(
     calendar = tmp_path / "calendar.csv"
     calendar.write_text("zona_raccolta,frazione,weekday\n1,vetro,martedi\n")
 
-    class Package:
+    class Package(RegressionModelPackage):
         model_version = "regressor-v1"
         sessions = {("vetro", 3): object()}
+
+        def __init__(self):
+            pass
 
         def predict(self, instances):
             assert all(item.cluster_label == 3 for item in instances)

@@ -11,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+import pipeline_config as config
 
 @dataclass(frozen=True)
 class Node:
@@ -120,7 +122,7 @@ def regression_command(
             "--input",
             str(classified),
             "--split-ratios",
-            "80,10,10",
+            config.LEGACY_SPLIT_RATIOS,
             "--predictions-output",
             str(predictions),
             "--model-output",
@@ -155,11 +157,11 @@ def regression_command(
         "--input",
         str(classified),
         "--split-ratios",
-        "80,10,10",
+        config.LEGACY_SPLIT_RATIOS,
         "--epochs",
-        "3",
+        str(config.LEGACY_SGD_EPOCHS),
         "--batch-size",
-        "4096",
+        str(config.LEGACY_SGD_BATCH_SIZE),
         "--predictions-output",
         str(predictions),
         "--model-output",
@@ -374,7 +376,7 @@ def build_graph(
     annual_input: Path | None = None,
     calendar_input: Path | None = None,
     regressor: str = "sgd",
-    gpr_max_train_rows: int = 500,
+    gpr_max_train_rows: int = config.DEFAULT_GPR_MAX_TRAIN_ROWS,
     forecast_from_date: str | None = None,
     forecast_to_date: str | None = None,
     forecast_calendar: Path | None = None,
@@ -384,10 +386,10 @@ def build_graph(
 ) -> dict[str, Node]:
     annual_input = local_path(
         annual_input,
-        "data_csv_parquet/andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+        config.DEFAULT_ANNUAL_INPUT,
     )
     calendar_input = local_path(
-        calendar_input, "data_csv_parquet/calendario_raccolta.csv"
+        calendar_input, config.DEFAULT_CALENDAR_INPUT
     )
     assignments = artifact(
         output_dir, "data_csv_parquet/kmeans_assignments_annuo_peso_coord.csv"
@@ -427,7 +429,7 @@ def build_graph(
                 "--input",
                 str(annual_input),
                 "--n-clusters",
-                "6",
+                str(config.KMEANS_CLUSTERS),
                 "--output",
                 str(assignments),
                 "--output-format",
@@ -435,13 +437,13 @@ def build_graph(
                 "--model-output",
                 str(classifier_model),
                 "--coord-weight",
-                "8",
+                str(config.KMEANS_COORD_WEIGHT),
                 "--annual-kg-weight",
-                "0.5",
+                str(config.KMEANS_ANNUAL_KG_WEIGHT),
                 "--other-numeric-weight",
-                "1",
+                str(config.KMEANS_OTHER_NUMERIC_WEIGHT),
                 "--categorical-weight",
-                "1",
+                str(config.KMEANS_CATEGORICAL_WEIGHT),
                 "--seed",
                 seed,
             ],
@@ -463,9 +465,9 @@ def build_graph(
                 "--calendario",
                 str(calendar_input),
                 "--id-col",
-                "id_civico",
+                config.LEGACY_ID_COLUMN,
                 "--zona-col",
-                "zona_raccolta",
+                config.LEGACY_ZONE_COLUMN,
                 "--seed",
                 seed,
                 "--out",
@@ -473,7 +475,7 @@ def build_graph(
                 "--out-produzione",
                 str(production),
                 "--missing-calendar-mode",
-                "daily",
+                config.MISSING_CALENDAR_MODE,
             ],
             inputs=(
                 assignments,
@@ -607,7 +609,7 @@ def build_complete_parquet_graph(
                 "--input",
                 str(annual_input),
                 "--n-clusters",
-                "6",
+                str(config.KMEANS_CLUSTERS),
                 "--output",
                 str(assignments),
                 "--output-format",
@@ -615,13 +617,13 @@ def build_complete_parquet_graph(
                 "--model-output",
                 str(classifier_model),
                 "--coord-weight",
-                "8",
+                str(config.KMEANS_COORD_WEIGHT),
                 "--annual-kg-weight",
-                "0.5",
+                str(config.KMEANS_ANNUAL_KG_WEIGHT),
                 "--other-numeric-weight",
-                "1",
+                str(config.KMEANS_OTHER_NUMERIC_WEIGHT),
                 "--categorical-weight",
-                "1",
+                str(config.KMEANS_CATEGORICAL_WEIGHT),
                 "--seed",
                 model_seed,
             ],
@@ -913,16 +915,16 @@ def build_zone_fraction_quantumleap_graph(
             None if collections_only else production,
             collections,
             calendar_input,
-            getattr(args, "annual_seed", 42),
-            getattr(args, "scenario_seed", 42),
-            getattr(args, "spillover_days", 14),
-            getattr(args, "missing_calendar_mode", "error"),
-            getattr(args, "generator_version", "quantumleap"),
+            getattr(args, "annual_seed", config.DEFAULT_ANNUAL_SEED),
+            getattr(args, "scenario_seed", config.DEFAULT_SCENARIO_SEED),
+            getattr(args, "spillover_days", config.DEFAULT_SPILLOVER_DAYS),
+            getattr(args, "missing_calendar_mode", config.DEFAULT_MISSING_CALENDAR_MODE),
+            getattr(args, "generator_version", config.QUANTUMLEAP_GENERATOR_VERSION),
             getattr(args, "exclude_episodic_fractions", False),
-            getattr(args, "hgb_loss", "poisson"),
+            getattr(args, "hgb_loss", config.DEFAULT_HGB_LOSS),
             getattr(args, "include_arima", False),
-            getattr(args, "validation_strategy", "fixed"),
-            getattr(args, "validation_folds", 5),
+            getattr(args, "validation_strategy", config.DEFAULT_VALIDATION_STRATEGY),
+            getattr(args, "validation_folds", config.DEFAULT_VALIDATION_FOLDS),
             ("quantumleap_snapshot",),
             getattr(args, "forecast_from_date", None),
             getattr(args, "forecast_to_date", None),
@@ -968,8 +970,8 @@ def build_quantumleap_graph(
     assignments = temp_dir / "quantumleap_assignments.parquet"
     classified = temp_dir / "quantumleap_classified.parquet"
     output_dir = getattr(args, "output_dir", None)
-    regressor = getattr(args, "regressor", "sgd")
-    gpr_max_train_rows = getattr(args, "gpr_max_train_rows", 500)
+    regressor = getattr(args, "regressor", config.DEFAULT_REGRESSOR)
+    gpr_max_train_rows = getattr(args, "gpr_max_train_rows", config.DEFAULT_GPR_MAX_TRAIN_ROWS)
     arima_group_level = getattr(args, "arima_group_level", False)
     arima_group_by = getattr(args, "arima_group_by", "cluster")
     classifier_model = artifact(
@@ -1045,7 +1047,7 @@ def build_quantumleap_graph(
                 "--input",
                 str(annual),
                 "--n-clusters",
-                "6",
+                str(config.KMEANS_CLUSTERS),
                 "--output",
                 str(assignments),
                 "--output-format",
@@ -1053,13 +1055,13 @@ def build_quantumleap_graph(
                 "--model-output",
                 str(classifier_model),
                 "--coord-weight",
-                "8",
+                str(config.KMEANS_COORD_WEIGHT),
                 "--annual-kg-weight",
-                "0.5",
+                str(config.KMEANS_ANNUAL_KG_WEIGHT),
                 "--other-numeric-weight",
-                "1",
+                str(config.KMEANS_OTHER_NUMERIC_WEIGHT),
                 "--categorical-weight",
-                "1",
+                str(config.KMEANS_CATEGORICAL_WEIGHT),
                 "--seed",
                 seed,
             ],
@@ -1182,7 +1184,7 @@ def build_file_pipeline_graph(
 ) -> dict[str, Node]:
     if args.pipeline == "zone-fraction":
         annual_input = getattr(args, "annual_input", None) or Path(
-            "data_csv_parquet/andria_distribuzione_annuale_completa.parquet"
+            config.DEFAULT_COMPLETE_ANNUAL_INPUT
         )
         graph = build_complete_parquet_graph(
             python,
@@ -1193,16 +1195,16 @@ def build_file_pipeline_graph(
             args.production_input,
             args.collections_input,
             args.calendar_input,
-            getattr(args, "annual_seed", 42),
-            getattr(args, "scenario_seed", 42),
-            getattr(args, "spillover_days", 14),
-            getattr(args, "missing_calendar_mode", "error"),
-            getattr(args, "generator_version", "unversioned-current"),
+            getattr(args, "annual_seed", config.DEFAULT_ANNUAL_SEED),
+            getattr(args, "scenario_seed", config.DEFAULT_SCENARIO_SEED),
+            getattr(args, "spillover_days", config.DEFAULT_SPILLOVER_DAYS),
+            getattr(args, "missing_calendar_mode", config.DEFAULT_MISSING_CALENDAR_MODE),
+            getattr(args, "generator_version", config.DEFAULT_GENERATOR_VERSION),
             getattr(args, "exclude_episodic_fractions", False),
-            getattr(args, "hgb_loss", "poisson"),
+            getattr(args, "hgb_loss", config.DEFAULT_HGB_LOSS),
             getattr(args, "include_arima", False),
-            getattr(args, "validation_strategy", "fixed"),
-            getattr(args, "validation_folds", 5),
+            getattr(args, "validation_strategy", config.DEFAULT_VALIDATION_STRATEGY),
+            getattr(args, "validation_folds", config.DEFAULT_VALIDATION_FOLDS),
             (),
             getattr(args, "forecast_from_date", None),
             getattr(args, "forecast_to_date", None),
@@ -1305,8 +1307,7 @@ def build_file_pipeline_graph(
         input_paths=(
             local_path(
                 getattr(args, "annual_input", None),
-                "data_csv_parquet/"
-                "andria_distribuzione_annuale_zone_inferite_e_zone_costruzione.csv",
+                config.DEFAULT_ANNUAL_INPUT,
             ),
             selected_calendar,
         ),
@@ -1446,8 +1447,8 @@ def main() -> None:
         description="Run the README ML pipeline as a file DAG."
     )
     parser.add_argument("--python", default=os.environ.get("PYTHON", sys.executable))
-    parser.add_argument("--seed", default=os.environ.get("SEED", "42"))
-    parser.add_argument("--anno", default=os.environ.get("ANNO", "2024"))
+    parser.add_argument("--seed", default=os.environ.get("SEED", str(config.DEFAULT_SEED)))
+    parser.add_argument("--anno", default=os.environ.get("ANNO", str(config.DEFAULT_YEAR)))
     parser.add_argument(
         "--pipeline",
         choices=["legacy", "zone-fraction"],
@@ -1456,9 +1457,9 @@ def main() -> None:
     parser.add_argument(
         "--regressor",
         choices=["sgd", "gpr", "hist_gradient_boosting", "arima"],
-        default="sgd",
+        default=config.DEFAULT_REGRESSOR,
     )
-    parser.add_argument("--gpr-max-train-rows", type=int, default=500)
+    parser.add_argument("--gpr-max-train-rows", type=int, default=config.DEFAULT_GPR_MAX_TRAIN_ROWS)
     parser.add_argument("--arima-group-level", action="store_true")
     parser.add_argument(
         "--arima-group-by", choices=["cluster", "zone"], default="cluster"
@@ -1476,37 +1477,37 @@ def main() -> None:
     parser.add_argument(
         "--production-input",
         type=Path,
-        default=Path("data_csv_parquet/produzione_giornaliera_completa.parquet"),
+        default=Path(config.DEFAULT_PRODUCTION_INPUT),
     )
     parser.add_argument(
         "--collections-input",
         type=Path,
-        default=Path("data_csv_parquet/conferimenti_giornalieri_completi.parquet"),
+        default=Path(config.DEFAULT_COLLECTIONS_INPUT),
     )
-    parser.add_argument("--annual-seed", type=int, default=42)
-    parser.add_argument("--scenario-seed", type=int, default=42)
-    parser.add_argument("--spillover-days", type=int, default=14)
+    parser.add_argument("--annual-seed", type=int, default=config.DEFAULT_ANNUAL_SEED)
+    parser.add_argument("--scenario-seed", type=int, default=config.DEFAULT_SCENARIO_SEED)
+    parser.add_argument("--spillover-days", type=int, default=config.DEFAULT_SPILLOVER_DAYS)
     parser.add_argument(
-        "--missing-calendar-mode", choices=["error", "daily"], default="error"
+        "--missing-calendar-mode", choices=["error", "daily"], default=config.DEFAULT_MISSING_CALENDAR_MODE
     )
-    parser.add_argument("--generator-version", default="unversioned-current")
+    parser.add_argument("--generator-version", default=config.DEFAULT_GENERATOR_VERSION)
     parser.add_argument("--exclude-episodic-fractions", action="store_true")
     parser.add_argument(
         "--hgb-loss",
         choices=["poisson", "squared_error"],
-        default="poisson",
+        default=config.DEFAULT_HGB_LOSS,
     )
     parser.add_argument(
         "--validation-strategy",
         choices=["fixed", "k-fold"],
-        default="fixed",
+        default=config.DEFAULT_VALIDATION_STRATEGY,
     )
-    parser.add_argument("--validation-folds", type=int, default=5)
+    parser.add_argument("--validation-folds", type=int, default=config.DEFAULT_VALIDATION_FOLDS)
     parser.add_argument("--include-arima", action="store_true")
     parser.add_argument(
         "--calendar-input",
         type=Path,
-        default=Path("data_csv_parquet/calendario_raccolta.csv"),
+        default=Path(config.DEFAULT_CALENDAR_INPUT),
     )
     parser.add_argument(
         "--output-dir",
@@ -1527,23 +1528,23 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--ql-url", default=os.environ.get("QL_URL", "http://localhost:8668")
+        "--ql-url", default=os.environ.get("QL_URL", config.DEFAULT_QL_URL)
     )
     parser.add_argument(
         "--ql-entity-type",
-        default=os.environ.get("ENTITY_TYPE", "RifiutiConferimento"),
+        default=os.environ.get("ENTITY_TYPE", config.DEFAULT_QL_ENTITY_TYPE),
     )
     parser.add_argument(
-        "--fiware-service", default=os.environ.get("FIWARE_SERVICE", "openiot")
+        "--fiware-service", default=os.environ.get("FIWARE_SERVICE", config.DEFAULT_FIWARE_SERVICE)
     )
     parser.add_argument(
         "--fiware-service-path",
-        default=os.environ.get("FIWARE_SERVICE_PATH", "/"),
+        default=os.environ.get("FIWARE_SERVICE_PATH", config.DEFAULT_FIWARE_SERVICE_PATH),
     )
     parser.add_argument(
         "--ql-timeout-seconds",
         type=float,
-        default=float(os.environ.get("QL_TIMEOUT_SECONDS", "30")),
+        default=float(os.environ.get("QL_TIMEOUT_SECONDS", str(config.DEFAULT_QL_TIMEOUT_SECONDS))),
     )
     parser.add_argument("--publish-orion", action="store_true")
     parser.add_argument("--forecast-from-date")
@@ -1551,25 +1552,25 @@ def main() -> None:
     parser.add_argument(
         "--forecast-calendar",
         default=os.environ.get(
-            "FORECAST_CALENDAR", "data_csv_parquet/calendario_raccolta.csv"
+            "FORECAST_CALENDAR", config.DEFAULT_CALENDAR_INPUT
         ),
     )
     parser.add_argument(
-        "--orion-url", default=os.environ.get("ORION_URL", "http://localhost:1026")
+        "--orion-url", default=os.environ.get("ORION_URL", config.DEFAULT_ORION_URL)
     )
     parser.add_argument(
         "--orion-entity-type",
-        default=os.environ.get("ORION_TWIN_ENTITY_TYPE", "RifiutiDigitalTwin"),
+        default=os.environ.get("ORION_TWIN_ENTITY_TYPE", config.DEFAULT_ORION_ENTITY_TYPE),
     )
     parser.add_argument(
         "--orion-timeout-seconds",
         type=float,
-        default=float(os.environ.get("ORION_TIMEOUT_SECONDS", "30")),
+        default=float(os.environ.get("ORION_TIMEOUT_SECONDS", str(config.DEFAULT_ORION_TIMEOUT_SECONDS))),
     )
     parser.add_argument(
         "--orion-batch-size",
         type=int,
-        default=int(os.environ.get("ORION_BATCH_SIZE", "50")),
+        default=int(os.environ.get("ORION_BATCH_SIZE", str(config.DEFAULT_ORION_BATCH_SIZE))),
     )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
