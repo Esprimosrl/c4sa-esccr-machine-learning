@@ -1569,7 +1569,7 @@ def main() -> None:
     parser.add_argument(
         "--orion-batch-size",
         type=int,
-        default=int(os.environ.get("ORION_BATCH_SIZE", "20")),
+        default=int(os.environ.get("ORION_BATCH_SIZE", "50")),
     )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

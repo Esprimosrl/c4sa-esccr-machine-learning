@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import sys
+import tempfile
 
 import duckdb
 import pandas as pd
@@ -75,6 +76,50 @@ def write_parquet(frame: pd.DataFrame, path: Path) -> None:
     con.register("frame", frame)
     con.execute("COPY frame TO ? (FORMAT PARQUET)", [str(path)])
     con.close()
+
+
+def fetch_to_parquet(
+    client: QuantumLeapClient,
+    attrs: list[str],
+    from_date: str,
+    to_date: str,
+    output: Path,
+    id_pattern: str | None,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".quantumleap-fetch-", dir=output.parent
+    ) as temp_dir:
+        temp = Path(temp_dir)
+        con = duckdb.connect(str(temp / "pages.duckdb"))
+        total = 0
+        try:
+            for rows in client.fetch_pages(
+                attrs,
+                from_date,
+                to_date,
+                id_pattern=id_pattern,
+                concurrency=2,
+            ):
+                page = pd.DataFrame(rows)
+                page["data"] = page["timestamp"]
+                con.register("page", page)
+                if total == 0:
+                    con.execute("CREATE TABLE history AS SELECT * FROM page")
+                else:
+                    con.execute("INSERT INTO history SELECT * FROM page")
+                con.unregister("page")
+                total += len(page)
+                print(f"QuantumLeap rows fetched: {total:,}", flush=True)
+
+            if total == 0:
+                raise ValueError("No QuantumLeap records matched the training range.")
+
+            staged = temp / "quantumleap.parquet"
+            con.execute("COPY history TO ? (FORMAT PARQUET)", [str(staged)])
+        finally:
+            con.close()
+        staged.replace(output)
 
 
 def annual_rows(daily: pd.DataFrame) -> pd.DataFrame:
@@ -347,14 +392,14 @@ def main() -> None:
             args.ql_timeout_seconds,
         )
         attrs = COMPLETE_DAILY_ATTRS if args.profile == "complete" else DAILY_ATTRS
-        rows = client.fetch(
-            list(attrs), args.from_date, args.to_date, id_pattern=args.ql_id_pattern
+        fetch_to_parquet(
+            client,
+            list(attrs),
+            args.from_date,
+            args.to_date,
+            args.output,
+            args.ql_id_pattern,
         )
-        if not rows:
-            raise ValueError("No QuantumLeap records matched the training range.")
-        frame = pd.DataFrame(rows)
-        frame["data"] = frame["timestamp"]
-        write_parquet(frame, args.output)
     elif args.command == "aggregate":
         write_parquet(annual_rows(read_parquet(args.input)), args.output)
     elif args.command == "join":

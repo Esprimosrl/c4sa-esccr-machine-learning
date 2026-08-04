@@ -630,16 +630,15 @@ def publish_twins(
     batch_size: int,
 ) -> int:
     with stage_path.open(encoding="utf-8") as source:
-        entities = [json.loads(line) for line in source]
-    return publish_entities(
-        entities,
-        orion_url,
-        fiware_service,
-        fiware_service_path,
-        timeout_seconds,
-        batch_size,
-        opener=urlopen,
-    )
+        return publish_entities(
+            (json.loads(line) for line in source),
+            orion_url,
+            fiware_service,
+            fiware_service_path,
+            timeout_seconds,
+            batch_size,
+            opener=urlopen,
+        )
 
 
 def main() -> None:

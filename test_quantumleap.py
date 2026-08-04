@@ -9,6 +9,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 
 import duckdb
 import joblib
@@ -25,6 +26,7 @@ from quantumleap import (
     QuantumLeapError,
     QuantumLeapTimeout,
 )
+from orion import publish_entities
 from onnx_clustering.app import (
     ModelPackage as ClusteringModelPackage,
     PredictionInput as ClusteringInput,
@@ -313,6 +315,84 @@ def test_client_encodes_query_headers_and_paginates(monkeypatch):
     headers = {key.lower(): value for key, value in requests[0][0].headers.items()}
     assert headers["fiware-service"] == "tenant"
     assert headers["fiware-servicepath"] == "/andria"
+
+
+def test_client_fetch_pages_runs_two_requests_and_preserves_offset_order(
+    monkeypatch,
+):
+    monkeypatch.setattr(quantumleap, "PAGE_SIZE", 2)
+    both_started = threading.Barrier(2)
+    second_finished = threading.Event()
+
+    def fake_open(request, timeout):
+        offset = int(parse_qs(urlparse(request.full_url).query)["offset"][0])
+        both_started.wait(timeout=5)
+        if offset == 0:
+            assert second_finished.wait(timeout=5)
+            indexes = [
+                "2024-01-01T00:00:00Z",
+                "2024-01-02T00:00:00Z",
+            ]
+            values = [1, 2]
+        else:
+            indexes = ["2024-01-03T00:00:00Z"]
+            values = [3]
+            second_finished.set()
+        return Response(
+            {"entities": [entity(indexes=indexes, x=values)]}
+        )
+
+    monkeypatch.setattr(quantumleap, "urlopen", fake_open)
+
+    pages = list(
+        client().fetch_pages(
+            ["x"],
+            "2024-01-01T00:00:00Z",
+            "2024-01-31T00:00:00Z",
+            concurrency=2,
+        )
+    )
+
+    assert [[row["x"] for row in page] for page in pages] == [[1, 2], [3]]
+
+
+def test_training_fetch_streams_pages_to_parquet(tmp_path):
+    class FakeClient:
+        def fetch_pages(self, *args, **kwargs):
+            assert kwargs["concurrency"] == 2
+            yield [
+                {
+                    "entity_id": "a",
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "x": 1,
+                }
+            ]
+            yield [
+                {
+                    "entity_id": "b",
+                    "timestamp": "2024-01-02T00:00:00Z",
+                    "x": 2,
+                }
+            ]
+
+    output = tmp_path / "history.parquet"
+    prepare.fetch_to_parquet(
+        FakeClient(),
+        ["x"],
+        "2024-01-01T00:00:00Z",
+        "2024-01-31T00:00:00Z",
+        output,
+        None,
+    )
+
+    rows = duckdb.connect().execute(
+        "SELECT entity_id, x, data FROM read_parquet(?) ORDER BY data",
+        [str(output)],
+    ).fetchall()
+    assert rows == [
+        ("a", 1, "2024-01-01T00:00:00Z"),
+        ("b", 2, "2024-01-02T00:00:00Z"),
+    ]
 
 
 def test_client_accepts_quantumleap_entity_id_schema_key(monkeypatch):
@@ -875,6 +955,78 @@ def test_orion_publication_batches_and_sends_tenant_headers(tmp_path, monkeypatc
     assert headers["fiware-service"] == "tenant"
     assert headers["fiware-servicepath"] == "/andria"
     assert requests[0][1] == 7
+
+
+def test_orion_publication_streams_two_concurrent_batches():
+    entities_read = 0
+    both_started = threading.Barrier(2)
+    consumed_when_started = []
+    requests = []
+
+    def entities():
+        nonlocal entities_read
+        for index in range(5):
+            entities_read += 1
+            yield {"id": f"urn:test:{index}", "type": "Twin"}
+
+    def fake_open(request, timeout):
+        consumed_when_started.append(entities_read)
+        requests.append(request)
+        if len(requests) <= 2:
+            both_started.wait(timeout=5)
+
+        class OrionResponse:
+            status = 204
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+        return OrionResponse()
+
+    assert publish_entities(
+        entities(),
+        "http://orion:1026",
+        "tenant",
+        "/",
+        7,
+        batch_size=2,
+        opener=fake_open,
+        concurrency=2,
+    ) == 5
+
+    assert max(consumed_when_started[:2]) <= 4
+    assert sorted(
+        entity["id"]
+        for request in requests
+        for entity in json.loads(request.data)["entities"]
+    ) == [f"urn:test:{index}" for index in range(5)]
+
+
+def test_twin_stage_is_passed_to_orion_lazily(tmp_path, monkeypatch):
+    stage = tmp_path / "twins.jsonl"
+    stage.write_text(
+        "".join(
+            json.dumps({"id": f"urn:test:{index}", "type": "Twin"}) + "\n"
+            for index in range(3)
+        )
+    )
+
+    def fake_publish(entities, *args, **kwargs):
+        assert not isinstance(entities, list)
+        assert [entity["id"] for entity in entities] == [
+            "urn:test:0",
+            "urn:test:1",
+            "urn:test:2",
+        ]
+        return 3
+
+    monkeypatch.setattr(publisher, "publish_entities", fake_publish)
+    assert publisher.publish_twins(
+        stage, "http://orion:1026", "tenant", "/", 7, 100
+    ) == 3
 
 
 def test_existing_models_stage_digital_twin_predictions(tmp_path):

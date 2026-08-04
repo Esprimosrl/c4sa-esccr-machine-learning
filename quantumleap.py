@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import socket
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -67,6 +68,27 @@ class QuantumLeapClient:
         entity_ids: list[str] | None = None,
         id_pattern: str | None = None,
     ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for page in self.fetch_pages(
+            attrs,
+            from_date,
+            to_date,
+            entity_ids=entity_ids,
+            id_pattern=id_pattern,
+        ):
+            rows.extend(page)
+        return rows
+
+    def fetch_pages(
+        self,
+        attrs: list[str],
+        from_date: str,
+        to_date: str,
+        *,
+        entity_ids: list[str] | None = None,
+        id_pattern: str | None = None,
+        concurrency: int = 1,
+    ) -> Iterator[list[dict[str, Any]]]:
         if not attrs or len(attrs) != len(set(attrs)):
             raise ValueError("attrs must be a non-empty list without duplicates.")
         if entity_ids and id_pattern:
@@ -77,11 +99,10 @@ class QuantumLeapClient:
             raise ValueError("entity_ids must contain non-empty strings.")
         if parse_datetime(from_date) > parse_datetime(to_date):
             raise ValueError("from_date must not be after to_date.")
+        if concurrency <= 0:
+            raise ValueError("concurrency must be greater than zero.")
 
-        rows: list[dict[str, Any]] = []
-        offset = 0
-        last_timestamp: dict[str, datetime] = {}
-        while True:
+        def get_page(offset: int) -> Any:
             params: dict[str, str | int] = {
                 "attrs": ",".join(attrs),
                 "fromDate": from_date,
@@ -99,13 +120,22 @@ class QuantumLeapClient:
                 f"{self.url}/v2/types/{path}?{urlencode(params)}",
                 headers=self.headers,
             )
-            payload = self._get_json(request)
-            page = self._normalize(payload, attrs, last_timestamp)
-            rows.extend(page)
-            if len(page) < PAGE_SIZE:
-                break
-            offset += PAGE_SIZE
-        return rows
+            return self._get_json(request)
+
+        last_timestamp: dict[str, datetime] = {}
+        offset = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            while True:
+                offsets = [
+                    offset + worker * PAGE_SIZE for worker in range(concurrency)
+                ]
+                for payload in executor.map(get_page, offsets):
+                    page = self._normalize(payload, attrs, last_timestamp)
+                    if page:
+                        yield page
+                    if len(page) < PAGE_SIZE:
+                        return
+                offset += concurrency * PAGE_SIZE
 
     def fetch_latest(
         self,

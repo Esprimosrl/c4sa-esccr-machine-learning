@@ -846,7 +846,7 @@ gli input storici e statici della pipeline di training.
 | `ORION_TIMEOUT_SECONDS` | `30` | Pipeline e servizi |
 | `ORION_TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Training |
 | `TWIN_ENTITY_TYPE` | `RifiutiDigitalTwin` | Servizi ONNX |
-| `ORION_BATCH_SIZE` | `20` | Training |
+| `ORION_BATCH_SIZE` | `50` | Training |
 | `QL_LABEL_WAIT_SECONDS` | `5` | Regressore ONNX |
 | `FORECAST_CALENDAR` | calendario incluso | Training e regressore ONNX |
 | `MODEL_DIR` | `/models` | Servizi ONNX |

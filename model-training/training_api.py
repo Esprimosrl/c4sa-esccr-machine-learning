@@ -71,7 +71,10 @@ class FileTrainingRequest(StrictModel):
         if horizon and horizon.forecast_from_date <= date(self.year, 12, 31):
             raise ValueError("forecast dates must be after the training year")
         if self.pipeline == "zone-fraction":
-            if self.production_input_path is None or self.collections_input_path is None:
+            if (
+                self.production_input_path is None
+                or self.collections_input_path is None
+            ):
                 raise ValueError(
                     "zone-fraction file input requires production_input_path "
                     "and collections_input_path"
@@ -126,7 +129,10 @@ class QuantumLeapTrainingRequest(StrictModel):
         if self.year is None:
             self.year = training_start.year
         if self.pipeline == "zone-fraction":
-            if training_start.year != training_end.year or self.year != training_start.year:
+            if (
+                training_start.year != training_end.year
+                or self.year != training_start.year
+            ):
                 raise ValueError("zone-fraction QuantumLeap input must cover one year")
             if self.calendar_input_path is None:
                 raise ValueError(
@@ -178,7 +184,7 @@ class JobStatus(StrictModel):
 
 jobs: dict[str, JobStatus] = {}
 jobs_lock = threading.Lock()
-# ponytail: one active in-process job; use a durable queue if multi-worker dispatch is needed.
+# one active in-process job; use a durable queue if multi-worker dispatch is needed.
 active_job_id: str | None = None
 
 app = FastAPI(title="ML training pipeline", version="1")
@@ -206,9 +212,7 @@ def prepare_request(payload: TrainingRequest) -> TrainingRequest:
             status_code=422,
             detail=f"output_dir cannot be created: {output_dir}: {exc.strerror}",
         ) from exc
-    if not output_dir.is_dir() or not os.access(
-        output_dir, os.W_OK | os.X_OK
-    ):
+    if not output_dir.is_dir() or not os.access(output_dir, os.W_OK | os.X_OK):
         raise HTTPException(
             status_code=422,
             detail=f"output_dir must be a writable directory: {output_dir}",
@@ -238,9 +242,7 @@ def prepare_request(payload: TrainingRequest) -> TrainingRequest:
                     payload.forecast.forecast_calendar_path,
                     "forecast.forecast_calendar_path",
                 )
-            updates["forecast"] = payload.forecast.model_copy(
-                update=forecast_updates
-            )
+            updates["forecast"] = payload.forecast.model_copy(update=forecast_updates)
         if payload.orion:
             orion_updates = {}
             if payload.orion.forecast_calendar_path:
@@ -303,9 +305,7 @@ def quantumleap_args(payload: QuantumLeapTrainingRequest) -> SimpleNamespace:
         forecast_from_date=(
             forecast.forecast_from_date.isoformat() if forecast else None
         ),
-        forecast_to_date=(
-            forecast.forecast_to_date.isoformat() if forecast else None
-        ),
+        forecast_to_date=(forecast.forecast_to_date.isoformat() if forecast else None),
         forecast_calendar=(
             str(forecast.forecast_calendar_path or payload.calendar_input_path)
             if forecast
@@ -325,10 +325,8 @@ def quantumleap_args(payload: QuantumLeapTrainingRequest) -> SimpleNamespace:
         orion_entity_type=os.environ.get(
             "ORION_TWIN_ENTITY_TYPE", "RifiutiDigitalTwin"
         ),
-        orion_timeout_seconds=positive_env(
-            "ORION_TIMEOUT_SECONDS", "30", float
-        ),
-        orion_batch_size=positive_env("ORION_BATCH_SIZE", "20", int),
+        orion_timeout_seconds=positive_env("ORION_TIMEOUT_SECONDS", "30", float),
+        orion_batch_size=positive_env("ORION_BATCH_SIZE", "50", int),
     )
 
 
@@ -370,10 +368,8 @@ def file_args(payload: FileTrainingRequest) -> SimpleNamespace:
         orion_entity_type=os.environ.get(
             "ORION_TWIN_ENTITY_TYPE", "RifiutiDigitalTwin"
         ),
-        orion_timeout_seconds=positive_env(
-            "ORION_TIMEOUT_SECONDS", "30", float
-        ),
-        orion_batch_size=positive_env("ORION_BATCH_SIZE", "20", int),
+        orion_timeout_seconds=positive_env("ORION_TIMEOUT_SECONDS", "30", float),
+        orion_batch_size=positive_env("ORION_BATCH_SIZE", "50", int),
         fiware_service=os.environ.get("FIWARE_SERVICE", "openiot"),
         fiware_service_path=os.environ.get("FIWARE_SERVICE_PATH", "/"),
     )
@@ -381,9 +377,7 @@ def file_args(payload: FileTrainingRequest) -> SimpleNamespace:
 
 def update_job(job_id: str, job_status: str, error: str | None = None) -> None:
     with jobs_lock:
-        jobs[job_id] = JobStatus(
-            job_id=job_id, status=job_status, error=error
-        )
+        jobs[job_id] = JobStatus(job_id=job_id, status=job_status, error=error)
 
 
 def run_job(job_id: str, payload: TrainingRequest) -> None:
